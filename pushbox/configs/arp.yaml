@@ -1,0 +1,150 @@
+name: pushbox_arp
+_target_: pushbox.workspace.PushBoxARPWorkspace
+
+task:
+  dataset:
+    _target_: pushbox.dataset.PushBoxImageDataset
+    demo_dir: null   # uses pushbox.paths.DEFAULT_DEMO_DIR
+    horizon: 50  # 数据集采样窗口长度（每个训练样本的连续帧数），需 ≥ policy.horizon
+    pad_before: 1
+    pad_after: 7
+    seed: 42
+    val_ratio: 0.2          # 100 demos -> 80 train / 20 val
+    max_train_episodes: null  # use all non-val episodes for train
+    max_frames_per_ep: 100   # subsample long episodes to save RAM
+    image_size: 96
+  env_runner:
+    _target_: pushbox.env_runner.PushBoxImageRunner
+    output_dir: ${hydra:runtime.output_dir}
+    n_eval_episodes: 10
+    max_steps: 500
+  image_shape: [3, 96, 96]
+  name: pushbox_image
+  shape_meta:
+    action:
+      shape: [7]
+    obs:
+      agent_pos:
+        shape: [9]
+        type: low_dim
+      box_pos:
+        shape: [2]
+        type: low_dim
+      top45:
+        shape: [3, 96, 96]
+        type: rgb
+      sideview:
+        shape: [3, 96, 96]
+        type: rgb
+
+dataloader:
+  batch_size: 32
+  num_workers: 0
+  persistent_workers: false
+  pin_memory: false
+  shuffle: true
+
+val_dataloader:
+  batch_size: 32
+  num_workers: 0
+  persistent_workers: false
+  pin_memory: false
+  shuffle: false
+
+training:
+  checkpoint_every: 10
+  debug: false
+  device: cuda:0
+  gradient_accumulate_every: 1
+  lr_scheduler: cosine
+  lr_warmup_steps: 100
+  max_train_steps: null
+  max_val_steps: 20
+  num_epochs: 150
+  resume: false
+  resume_path: null  # path to latest.ckpt from a previous run
+  rollout_every: 25
+  sample_every: 50
+  seed: 42
+  tqdm_interval_sec: 1.0
+  use_ema: true
+  val_every: 10
+  stop_at_epoch: 150
+
+ema:
+  _target_: pushbox.diffusion_policy.model.diffusion.ema_model.EMAModel
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+
+optimizer:
+  betas: [0.95, 0.999]
+  lr: 0.0001
+  obs_encoder_weight_decay: 1.0e-06
+  transformer_weight_decay: 0.001
+
+logging:
+  group: null
+  id: null
+  mode: online
+  name: pushbox_arp
+  entity: huiyuan_tac
+  project: adaptive_chunk
+  tags: [pushbox, arp]
+
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    format_str: epoch={epoch:04d}-val_loss={val_loss:.3f}.ckpt
+    k: 3
+    mode: min
+    monitor_key: val_loss
+
+policy:
+  _target_: pushbox.policy.PushBoxARPolicy
+  shape_meta:
+    action:
+      shape: [7]
+    obs:
+      agent_pos:
+        shape: [9]
+        type: low_dim
+      box_pos:
+        shape: [2]
+        type: low_dim
+      top45:
+        shape: [3, 96, 96]
+        type: rgb
+      sideview:
+        shape: [3, 96, 96]
+        type: rgb
+  crop_shape: [84, 84]
+  eval_fixed_crop: true
+  obs_encoder_group_norm: true
+  pretrained: true
+  freeze_obs_encoder: true
+  horizon: 20  # 策略预测的未来 action 步数
+  n_action_steps: 20
+  n_obs_steps: 2
+  arp_cfg:
+    plan_steps: 0
+    plan_chunk_size: 0
+    action_chunk_size: 20
+    num_latents: 5
+    layer_norm_every_block: false
+    n_embd: 64
+    embd_pdrop: 0.1
+    num_layers: 6
+    layer_cfg:
+      n_head: 8
+      mlp_ratio: 4.0
+      AdaLN: true
+      mlp_dropout: 0.1
+      attn_kwargs: {attn_pdrop: 0.1, resid_pdrop: 0.1}
+      cond_attn_kwargs: {attn_pdrop: 0.1, resid_pdrop: 0.1}
+    sample: true
+    augment_ratio: 0.0
+    low_var_eval: true

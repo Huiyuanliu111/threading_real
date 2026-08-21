@@ -1,0 +1,130 @@
+name: threading_real_arp
+_target_: pushbox.workspace.PushBoxARPWorkspace
+
+task:
+  dataset:
+    _target_: threading_task.dataset.ThreadingRealLeRobotDataset
+    dataset_path: /home/tele/Thesis_project/Record_layer/data_lerobot_latest
+    horizon: 20
+    pad_before: 1
+    pad_after: 7
+    seed: 42
+    val_ratio: 0.2
+    max_train_episodes: null
+    max_frames_per_ep: null
+    camera_keys:
+      - observation.images.exterior_image_1_left
+      - observation.images.wrist_image_left
+      - observation.images.exterior_image_2_right
+    camera_output_keys: [top45, wrist, sideview]
+    image_size: 96
+    n_obs_steps: ${policy.n_obs_steps}
+    state_key: observation.state
+    action_key: action
+    max_cached_video_episodes: 2
+  image_shape: [3, 96, 96]
+  name: threading_real_image
+  shape_meta: &shape_meta
+    action: {shape: [8]}
+    obs:
+      agent_pos: {shape: [8], type: low_dim}
+      top45: {shape: [3, 96, 96], type: rgb}
+      wrist: {shape: [3, 96, 96], type: rgb}
+      sideview: {shape: [3, 96, 96], type: rgb}
+
+dataloader: {batch_size: 16, num_workers: 2, persistent_workers: true, pin_memory: true, shuffle: true}
+val_dataloader: {batch_size: 16, num_workers: 2, persistent_workers: true, pin_memory: true, shuffle: false}
+
+training:
+  checkpoint_every: 5
+  debug: false
+  device: cuda:0
+  enable_rollout: false
+  gradient_accumulate_every: 1
+  lr_scheduler: cosine
+  lr_warmup_steps: 100
+  max_train_steps: null
+  max_val_steps: 20
+  num_epochs: 150
+  resume: false
+  resume_path: null
+  rollout_every: 25
+  sample_every: 50
+  seed: 42
+  tqdm_interval_sec: 1.0
+  use_ema: true
+  val_every: 10
+  stop_at_epoch: 150
+
+ema:
+  _target_: pushbox.diffusion_policy.model.diffusion.ema_model.EMAModel
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+
+optimizer:
+  betas: [0.95, 0.999]
+  lr: 0.0001
+  obs_encoder_weight_decay: 1.0e-06
+  transformer_weight_decay: 0.001
+  obs_encoder_lr: 0.00001
+  obs_projection_lr: 0.0001
+
+logging:
+  group: null
+  id: null
+  mode: online
+  name: threading_real_arp
+  entity: huiyuan_tac
+  project: adaptive_chunk
+  tags: [threading_real, lerobot, real_robot, arp]
+
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    format_str: epoch={epoch:04d}-val_loss={val_loss:.3f}.ckpt
+    k: 3
+    mode: min
+    monitor_key: val_loss
+
+policy:
+  _target_: threading_task.policy.ThreadingARPolicy
+  shape_meta: *shape_meta
+  camera_obs_keys:
+    - observation.images.exterior_image_1_left
+    - observation.images.wrist_image_left
+    - observation.images.exterior_image_2_right
+  obs_encoder_group_norm: true
+  pretrained: true
+  backbone: resnet18
+  freeze_obs_encoder: true
+  use_view_fusion: true
+  horizon: 20
+  n_action_steps: 20
+  n_obs_steps: 2
+  image_augmentation:
+    brightness: 0.1
+    contrast: 0.1
+    saturation: 0.05
+  arp_cfg:
+    plan_steps: 0
+    plan_chunk_size: 1
+    action_chunk_size: 20
+    num_latents: 5
+    action_predictor: gmm
+    layer_norm_every_block: false
+    n_embd: 64
+    embd_pdrop: 0.1
+    num_layers: 6
+    layer_cfg:
+      n_head: 8
+      mlp_ratio: 4.0
+      AdaLN: true
+      mlp_dropout: 0.1
+      attn_kwargs: {attn_pdrop: 0.1, resid_pdrop: 0.1}
+      cond_attn_kwargs: {attn_pdrop: 0.1, resid_pdrop: 0.1}
+    sample: true
+    low_var_eval: true
