@@ -10,9 +10,8 @@ import cv2
 import numpy as np
 
 DEFAULT_REAL_CAMERA_KEYS = (
-    "observation.images.exterior_image_1_left",
-    "observation.images.wrist_image_left",
     "observation.images.exterior_image_2_right",
+    "observation.images.wrist_image_left",
 )
 
 
@@ -47,6 +46,132 @@ def _video_info(path: Path) -> dict:
     }
 
 
+def _validate_v3(
+    root: Path,
+    info: dict,
+    camera_keys: tuple[str, ...],
+    state_key: str,
+    action_key: str,
+    expected_state_dim: int | None,
+    expected_action_dim: int | None,
+    max_episodes: int | None,
+) -> dict:
+    """Validate official v3 shards and decode one frame from each checked episode."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise ImportError("pyarrow is required to validate LeRobot parquet files") from exc
+    try:
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    except ImportError as exc:
+        raise ImportError("lerobot>=0.4.0 is required to validate Dataset v3.0") from exc
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    features = info.get("features", {})
+    for key in (state_key, action_key, *camera_keys):
+        if key not in features:
+            errors.append(f"missing feature {key!r}")
+    parquet_files = sorted((root / "data").rglob("*.parquet"))
+    if not parquet_files:
+        errors.append("no parquet files under data/")
+        return {
+            "dataset": str(root),
+            "codebase_version": info.get("codebase_version"),
+            "errors": errors,
+            "warnings": warnings,
+            "valid": False,
+        }
+
+    rows: list[tuple[int, int, int, np.ndarray, np.ndarray]] = []
+    columns = ["episode_index", "frame_index", "index", state_key, action_key]
+    for parquet_path in parquet_files:
+        try:
+            table = pq.read_table(str(parquet_path), columns=columns)
+            episodes = table.column("episode_index").to_pylist()
+            frames = table.column("frame_index").to_pylist()
+            indices = table.column("index").to_pylist()
+            states = np.asarray(table.column(state_key).to_pylist(), dtype=np.float32)
+            actions = np.asarray(table.column(action_key).to_pylist(), dtype=np.float32)
+        except Exception as exc:
+            errors.append(f"{parquet_path}: cannot read required v3 columns: {exc}")
+            continue
+        rows.extend(
+            (int(ep), int(frame), int(index), state, action)
+            for ep, frame, index, state, action in zip(
+                episodes, frames, indices, states, actions, strict=True
+            )
+        )
+    rows.sort(key=lambda row: row[2])
+    if [row[2] for row in rows] != list(range(len(rows))):
+        errors.append("global index column is not contiguous from zero")
+
+    episode_ids = sorted({row[0] for row in rows})
+    if max_episodes is not None:
+        episode_ids = episode_ids[:max_episodes]
+    dataset = None
+    if not errors:
+        try:
+            dataset = LeRobotDataset(
+                repo_id="local/threading_real_validation",
+                root=root,
+                download_videos=False,
+            )
+        except Exception as exc:
+            errors.append(f"official LeRobotDataset cannot load dataset: {exc}")
+
+    episode_reports = []
+    for episode_id in episode_ids:
+        episode_rows = [row for row in rows if row[0] == episode_id]
+        frame_indices = [row[1] for row in episode_rows]
+        if frame_indices != list(range(len(episode_rows))):
+            errors.append(f"episode {episode_id}: frame_index is not contiguous from zero")
+        states = np.stack([row[3] for row in episode_rows])
+        actions = np.stack([row[4] for row in episode_rows])
+        if expected_state_dim is not None and states.shape[1:] != (expected_state_dim,):
+            errors.append(f"episode {episode_id}: state shape {states.shape}")
+        if expected_action_dim is not None and actions.shape[1:] != (expected_action_dim,):
+            errors.append(f"episode {episode_id}: action shape {actions.shape}")
+        if not np.isfinite(states).all() or not np.isfinite(actions).all():
+            errors.append(f"episode {episode_id}: state/action contains NaN or Inf")
+
+        camera_report = {}
+        if dataset is not None and episode_rows:
+            dataset_index = episode_rows[0][2]
+            try:
+                sample = dataset[dataset_index]
+                for camera_key in camera_keys:
+                    image = sample[camera_key]
+                    if hasattr(image, "detach"):
+                        image = image.detach().cpu().numpy()
+                    image = np.asarray(image)
+                    camera_report[camera_key] = {"shape": list(image.shape)}
+                    if image.ndim != 3 or not np.isfinite(image).all():
+                        errors.append(f"episode {episode_id}: invalid decoded {camera_key}")
+            except Exception as exc:
+                errors.append(f"episode {episode_id}: cannot decode camera sample: {exc}")
+        episode_reports.append(
+            {"episode_index": episode_id, "frames": len(episode_rows), "cameras": camera_report}
+        )
+
+    if info.get("fps") != 30:
+        warnings.append(f"expected vla_finetune 30 FPS, got {info.get('fps')}")
+    return {
+        "dataset": str(root),
+        "codebase_version": info.get("codebase_version"),
+        "fps": info.get("fps"),
+        "episodes_checked": len(episode_reports),
+        "total_frames_checked": sum(report["frames"] for report in episode_reports),
+        "state_feature": features.get(state_key),
+        "action_feature": features.get(action_key),
+        "camera_keys": list(camera_keys),
+        "episodes": episode_reports,
+        "errors": errors,
+        "warnings": warnings,
+        "valid": not errors,
+    }
+
+
 def validate(
     dataset_path: Path,
     camera_keys: tuple[str, ...],
@@ -63,6 +188,17 @@ def validate(
     if not info_path.exists():
         raise FileNotFoundError(f"missing {info_path}")
     info = json.loads(info_path.read_text())
+    if str(info.get("codebase_version", "")).startswith("v3"):
+        return _validate_v3(
+            root,
+            info,
+            camera_keys,
+            state_key,
+            action_key,
+            expected_state_dim,
+            expected_action_dim,
+            max_episodes,
+        )
     features = info.get("features", {})
     for key in (state_key, action_key, *camera_keys):
         if key not in features:

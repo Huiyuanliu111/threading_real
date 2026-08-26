@@ -1,19 +1,31 @@
 # Threading Real-Robot Training
 
 This pipeline trains the existing `threading_task.policy.ThreadingARPolicy` on
-real Franka recordings converted to LeRobot format by `Record_layer`.
+real Franka recordings converted to official LeRobot Dataset v3.0 format.
 
-The launcher `Record_layer/run_dual_robot_recording.sh` records raw trial
-folders first. Convert those trials with `Record_layer/build_latest_lerobot_dataset.py`
-before training here.
+The `vla_finetune` recorder creates raw trial folders first. Convert a session
+from the `teleoperation` repository root:
+
+```bash
+python convert_vla_to_lerobot_v3.py \
+  vla_finetune/data/<session> \
+  data/threading_vla_lerobot_v3
+```
+
+The converter uses the official `lerobot` writer and creates v3 `meta/`,
+`data/`, and `videos/` shards. The current raw recorder does not persist camera
+or robot timestamps, so conversion uses normalized episode progress for 30 FPS
+alignment and records this limitation in `meta/vla_conversion_report.json`.
+The default raw-camera mapping is `cam1.mp4` = side view and `cam2.mp4` =
+wrist; pass explicit `--camera` arguments to the converter if the recording
+machine uses the opposite numbering.
 
 Expected LeRobot features:
 
 | Model input | LeRobot feature |
 | --- | --- |
-| `top45` | `observation.images.exterior_image_1_left` |
-| `wrist` | `observation.images.wrist_image_left` |
 | `sideview` | `observation.images.exterior_image_2_right` |
+| `wrist` | `observation.images.wrist_image_left` |
 | `agent_pos` | `observation.state` = `[q1..q7, gripper_width]` |
 | `action` | `action` = next `[q1..q7, gripper_width]` |
 
@@ -22,7 +34,7 @@ Validate a converted dataset:
 ```bash
 cd /home/tele/threading_real
 python scripts/validate_threading_real_lerobot.py \
-  /home/tele/Thesis_project/Record_layer/data_lerobot_latest \
+  /path/to/threading_vla_lerobot_v3 \
   --max-episodes 3
 ```
 

@@ -19,6 +19,7 @@ import cv2
 import h5py
 import numpy as np
 import torch
+import torch.nn.functional as torch_functional
 
 from pushbox.diffusion_policy.common.normalize_util import get_image_range_normalizer
 from pushbox.diffusion_policy.common.pytorch_util import dict_apply
@@ -31,11 +32,10 @@ EEF_AGENT_STATE_DIM = 8
 ACTION_DIM = 7
 DEFAULT_CAMERA_KEYS = ("agentview_image", "robot0_eye_in_hand_image")
 DEFAULT_REAL_CAMERA_KEYS = (
-    "observation.images.exterior_image_1_left",
-    "observation.images.wrist_image_left",
     "observation.images.exterior_image_2_right",
+    "observation.images.wrist_image_left",
 )
-DEFAULT_REAL_CAMERA_OUTPUT_KEYS = ("top45", "wrist", "sideview")
+DEFAULT_REAL_CAMERA_OUTPUT_KEYS = ("sideview", "wrist")
 
 
 def sorted_demo_keys(data_group: h5py.Group) -> list[str]:
@@ -103,6 +103,30 @@ def _resize_video_frames(frames: np.ndarray, image_size: int) -> np.ndarray:
 
 def _fixed_list_column_to_numpy(column: Any) -> np.ndarray:
     return np.asarray(column.to_pylist(), dtype=np.float32)
+
+
+def _as_chw_image_tensor(image: Any, image_size: int, key: str) -> torch.Tensor:
+    """Normalize an official LeRobot decoded frame to CHW float32 [0, 1]."""
+    value = image.detach().cpu() if isinstance(image, torch.Tensor) else torch.as_tensor(image)
+    if value.ndim != 3:
+        raise ValueError(f"{key}: expected a 3D decoded image, got {tuple(value.shape)}")
+    if value.shape[0] in (1, 3, 4):
+        value = value[:3]
+    elif value.shape[-1] in (1, 3, 4):
+        value = value[..., :3].permute(2, 0, 1)
+    else:
+        raise ValueError(f"{key}: cannot infer channel axis from {tuple(value.shape)}")
+    value = value.to(torch.float32)
+    if value.numel() and float(value.max()) > 1.5:
+        value = value / 255.0
+    if tuple(value.shape[-2:]) != (image_size, image_size):
+        value = torch_functional.interpolate(
+            value.unsqueeze(0),
+            size=(image_size, image_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+    return value.clamp_(0.0, 1.0)
 
 
 def _build_sample_indices(
@@ -455,9 +479,10 @@ class _NullH5:
 class ThreadingRealLeRobotDataset(BaseImageDataset):
     """LeRobot-backed dataset for real Franka threading recordings.
 
-    Record_layer conversion stores one parquet per episode and one MP4 per
-    camera per episode. The real robot action space is kept as recorded:
-    next-frame joint position plus gripper width by default.
+    Official LeRobot v3 data is reconstructed from its consolidated parquet
+    shards and decoded through ``LeRobotDataset``. The previous episode-file
+    layout remains readable for backward compatibility. The real robot action
+    is next-frame joint position plus gripper width by default.
     """
 
     def __init__(
@@ -521,6 +546,8 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
             raise ValueError("max_validation_sequences must be positive")
 
         self.info = json.loads((path / "meta" / "info.json").read_text())
+        self.is_lerobot_v3 = str(self.info.get("codebase_version", "")).startswith("v3")
+        self._lerobot_dataset: Any | None = None
         features = self.info.get("features", {})
         missing_features = [
             key for key in (self.state_key, self.action_key, *self.camera_keys)
@@ -537,8 +564,12 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
 
         self.states: list[np.ndarray] = []
         self.actions: list[np.ndarray] = []
+        self.dataset_row_indices: list[np.ndarray] = []
         lengths = []
-        self._read_parquet_episodes(max_frames_per_ep)
+        if self.is_lerobot_v3:
+            self._read_v3_parquet_episodes(max_frames_per_ep)
+        else:
+            self._read_parquet_episodes(max_frames_per_ep)
         for state, action in zip(self.states, self.actions):
             if len(state) != len(action):
                 raise ValueError("state/action length mismatch in real LeRobot dataset")
@@ -548,7 +579,7 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
         self.action_dim = int(self.actions[0].shape[-1])
 
         self._video_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
-        n_ep = len(self.episode_paths)
+        n_ep = len(self.states)
         self.val_mask = get_val_mask(n_episodes=n_ep, val_ratio=val_ratio, seed=seed)
         self.train_mask = downsample_mask(~self.val_mask, max_n=max_train_episodes, seed=seed)
         self.sample_indices = _build_sample_indices(
@@ -584,6 +615,85 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
                 raise ValueError(f"{parquet_path}: state/action contains NaN or Inf")
             self.states.append(state.astype(np.float32, copy=False))
             self.actions.append(action.astype(np.float32, copy=False))
+
+    def _read_v3_parquet_episodes(self, max_frames_per_ep: int | None) -> None:
+        """Read v3 tabular shards and reconstruct episodes from their index columns."""
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as exc:
+            raise ImportError(
+                "ThreadingRealLeRobotDataset requires pyarrow to read LeRobot parquet files"
+            ) from exc
+
+        state_parts = []
+        action_parts = []
+        episode_parts = []
+        frame_parts = []
+        index_parts = []
+        required_columns = [
+            self.state_key,
+            self.action_key,
+            "episode_index",
+            "frame_index",
+            "index",
+        ]
+        for parquet_path in self.episode_paths:
+            table = pq.read_table(str(parquet_path), columns=required_columns)
+            state_parts.append(_fixed_list_column_to_numpy(table.column(self.state_key)))
+            action_parts.append(_fixed_list_column_to_numpy(table.column(self.action_key)))
+            episode_parts.append(
+                np.asarray(table.column("episode_index").to_pylist(), dtype=np.int64)
+            )
+            frame_parts.append(np.asarray(table.column("frame_index").to_pylist(), dtype=np.int64))
+            index_parts.append(np.asarray(table.column("index").to_pylist(), dtype=np.int64))
+
+        states = np.concatenate(state_parts)
+        actions = np.concatenate(action_parts)
+        episode_indices = np.concatenate(episode_parts)
+        frame_indices = np.concatenate(frame_parts)
+        dataset_indices = np.concatenate(index_parts)
+        order = np.argsort(dataset_indices, kind="stable")
+        states = states[order]
+        actions = actions[order]
+        episode_indices = episode_indices[order]
+        frame_indices = frame_indices[order]
+        dataset_indices = dataset_indices[order]
+        if not np.array_equal(dataset_indices, np.arange(len(dataset_indices))):
+            raise ValueError("LeRobot v3 global index column must be contiguous and start at zero")
+
+        for episode_index in np.unique(episode_indices):
+            rows = np.flatnonzero(episode_indices == episode_index)
+            rows = rows[np.argsort(frame_indices[rows], kind="stable")]
+            if not np.array_equal(frame_indices[rows], np.arange(len(rows))):
+                raise ValueError(
+                    f"episode {episode_index}: frame_index is not contiguous from zero"
+                )
+            if max_frames_per_ep is not None:
+                rows = rows[:max_frames_per_ep]
+            state = states[rows].astype(np.float32, copy=False)
+            action = actions[rows].astype(np.float32, copy=False)
+            if state.size == 0 or action.size == 0:
+                raise ValueError(f"episode {episode_index}: empty state/action episode")
+            if not np.isfinite(state).all() or not np.isfinite(action).all():
+                raise ValueError(f"episode {episode_index}: state/action contains NaN or Inf")
+            self.states.append(state)
+            self.actions.append(action)
+            self.dataset_row_indices.append(dataset_indices[rows])
+
+    def _get_lerobot_dataset(self):
+        if self._lerobot_dataset is None:
+            try:
+                from lerobot.datasets.lerobot_dataset import LeRobotDataset
+            except ImportError as exc:
+                raise ImportError(
+                    "Official LeRobot v3 image decoding requires lerobot>=0.4.0"
+                ) from exc
+            self._lerobot_dataset = LeRobotDataset(
+                repo_id="local/threading_real",
+                root=self.dataset_path,
+                download_videos=False,
+            )
+        return self._lerobot_dataset
 
     def _video_path(self, episode_index: int, camera_key: str) -> Path:
         episode_name = self.episode_paths[episode_index].stem
@@ -649,11 +759,13 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_video_cache"] = OrderedDict()
+        state["_lerobot_dataset"] = None
         return state
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
         val_set._video_cache = OrderedDict()
+        val_set._lerobot_dataset = None
         val_indices = _build_sample_indices(
             self.episode_lengths,
             self.val_mask,
@@ -711,6 +823,43 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
         action_is_pad = (raw_sequence_rows < 0) | (raw_sequence_rows >= length)
         sequence_rows = np.clip(raw_sequence_rows, 0, length - 1).astype(np.int64)
         obs_rows = sequence_rows[: min(self.n_obs_steps, self.horizon)]
+
+        if self.is_lerobot_v3:
+            dataset = self._get_lerobot_dataset()
+            decoded_frames = [
+                dataset[int(self.dataset_row_indices[episode_index][row])]
+                for row in obs_rows
+            ]
+            images = {
+                output_key: torch.stack(
+                    [
+                        _as_chw_image_tensor(frame[camera_key], image_size, camera_key)
+                        for frame in decoded_frames
+                    ]
+                )
+                for output_key, camera_key, image_size in zip(
+                    self.camera_output_keys,
+                    self.camera_keys,
+                    self.image_sizes,
+                    strict=True,
+                )
+            }
+            return {
+                "obs": {
+                    **images,
+                    "agent_pos": torch.from_numpy(
+                        self.states[episode_index][sequence_rows].astype(
+                            np.float32, copy=False
+                        )
+                    ),
+                },
+                "action": torch.from_numpy(
+                    self.actions[episode_index][sequence_rows].astype(
+                        np.float32, copy=False
+                    )
+                ),
+                "action_is_pad": torch.from_numpy(action_is_pad),
+            }
 
         videos = self._load_video_episode(episode_index)
         data = {
