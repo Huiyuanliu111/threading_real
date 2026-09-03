@@ -48,5 +48,88 @@ python pushbox/train.py \
   training.device=cuda:0
 ```
 
+### Delta-action retraining
+
+`threading_real_arp_delta_aug.yaml` predicts the next-state delta
+`[q(t+1), width(t+1)] - [q(t), width(t)]`. It also enables stronger training
+image augmentation (color, hue, pixel noise, and small translations). This is
+a different action representation, so do **not** resume an absolute-action
+checkpoint. Start a fresh run:
+
+```bash
+cd /home/huiyuan/teleoperation/threading_real
+python pushbox/train.py \
+  --config-name=threading_real_arp_delta_aug \
+  task.dataset.dataset_path=/home/huiyuan/teleoperation/data/threading_lerobot_v3 \
+  training.device=cuda:0
+```
+
+The delta checkpoint is automatically converted back to absolute joint targets
+by `scripts/deploy_threading_real.py` before TrackJ receives a plan.
+
 Real-robot rollout is disabled in `threading_real_arp.yaml`; evaluation should
-use held-out validation loss or a separate hardware deployment script.
+use held-out validation loss or the separate follower deployment runner below.
+
+## Single-follower deployment
+
+The two-arm leader/follower executable is only used to collect demonstrations.
+At deployment time, run `remote_controller_server` on the follower controller
+PC and run the Python policy client on the inference PC. The server IP used by
+the examples below depends on whether these are the same machine.
+
+The runner imports the repository-local controller client automatically. To use
+it independently elsewhere, install it in the policy environment:
+
+```bash
+python -m pip install -e ../remote_controller
+python -m pip install pyrealsense2
+```
+
+Start the server on the follower controller PC:
+
+```bash
+cd /home/huiyuan/teleoperation/remote_controller
+./run_server.sh
+```
+
+First run observation and inference only. This mode never starts TrackJ or
+sends gripper commands:
+
+```bash
+cd /home/huiyuan/teleoperation/threading_real
+python scripts/deploy_threading_real.py \
+  outputs/2026-08-31/11-10-27/checkpoints/epoch=0005-val_loss=-18.758.ckpt \
+  --server-url http://localhost:8008/RPC2 \
+  --server-ip 127.0.0.1 \
+  --udp-ip 127.0.0.1 \
+  --max-cycles 20
+```
+
+If inference runs on a different PC, `--server-url` and `--server-ip` must use
+the follower controller PC address, while `--udp-ip` must be an address of the
+inference PC reachable by the server.
+
+After inspecting the dry-run predictions and clearing the workspace, real
+motion requires both acknowledgement flags:
+
+```bash
+python scripts/deploy_threading_real.py \
+  outputs/2026-08-31/11-10-27/checkpoints/epoch=0005-val_loss=-18.758.ckpt \
+  --execute --confirm-real-robot \
+  --move-to-training-start
+```
+
+The runner uses the same RealSense serial mapping as data collection: camera
+`233722072293` is `sideview`/`cam1`, and camera `233622071984` is
+`wrist`/`cam2`. Override `--sideview-serial` and `--wrist-serial` if the
+hardware mapping changes. Keep the Franka user stop reachable. Any camera,
+fresh-state, inference, or controller error exits the loop and requests TrackJ
+to stop. Hardware inference defaults to deterministic GMM MAP output. Raw
+targets with a first-point or adjacent-point jump above `0.15 rad` abort the
+rollout before that chunk is sent; smaller targets are additionally rate
+limited by `--max-first-delta` and `--max-step-delta`.
+
+`--move-to-training-start` first moves the follower at low speed to the common
+recorded start posture
+`[0.0282, -0.1471, -0.0009, -2.2778, -0.0127, 2.0894, 0.7897]` rad and opens
+the gripper. It is intentionally unavailable in dry-run mode.

@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as tv_models
 import torchvision.transforms.functional as tv_functional
+from torchvision.transforms import InterpolationMode
 
 from pushbox import arp
 from chunk_selector.chunk_selector import ChunkSelection, ChunkSelector
@@ -56,6 +57,7 @@ class ThreadingARPolicy(BaseImagePolicy):
         obs_encoder_group_norm: bool = True,
         use_view_fusion: bool = True,
         image_augmentation: dict[str, float] | None = None,
+        action_mode: str = "absolute",
         arp_cfg: dict[str, Any] | None = None,
         **unused_kwargs,
     ):
@@ -69,6 +71,9 @@ class ThreadingARPolicy(BaseImagePolicy):
         self.agent_state_dim = int(state_shape[0])
         if self.agent_state_dim < self.action_dim:
             raise ValueError("Threading state width must be at least the action width")
+        if action_mode not in {"absolute", "delta"}:
+            raise ValueError("action_mode must be 'absolute' or 'delta'")
+        self.action_mode = action_mode
 
         self.rgb_keys = tuple(
             key for key, value in shape_meta["obs"].items() if value.get("type") == "rgb"
@@ -128,6 +133,9 @@ class ThreadingARPolicy(BaseImagePolicy):
             "brightness",
             "contrast",
             "saturation",
+            "hue",
+            "noise_std",
+            "translate",
         }
         if unsupported_augmentations:
             raise ValueError(
@@ -312,6 +320,29 @@ class ThreadingARPolicy(BaseImagePolicy):
                 ) * strength
                 adjust = getattr(tv_functional, f"adjust_{name}")
                 output = adjust(output, factor)
+            hue_strength = self.image_augmentation.get("hue", 0.0)
+            if hue_strength > 0:
+                hue_factor = (torch.rand((), device=image.device).item() * 2.0 - 1.0) * hue_strength
+                output = tv_functional.adjust_hue(output, hue_factor)
+            translate_strength = self.image_augmentation.get("translate", 0.0)
+            if translate_strength > 0:
+                height, width = output.shape[-2:]
+                translate = [
+                    int((torch.rand((), device=image.device).item() * 2.0 - 1.0) * translate_strength * width),
+                    int((torch.rand((), device=image.device).item() * 2.0 - 1.0) * translate_strength * height),
+                ]
+                output = tv_functional.affine(
+                    output,
+                    angle=0.0,
+                    translate=translate,
+                    scale=1.0,
+                    shear=[0.0, 0.0],
+                    interpolation=InterpolationMode.BILINEAR,
+                    fill=0.0,
+                )
+            noise_std = self.image_augmentation.get("noise_std", 0.0)
+            if noise_std > 0:
+                output = output + torch.randn_like(output) * noise_std
             augmented.append(output)
         return torch.stack(augmented).clamp_(0.0, 1.0)
 

@@ -113,6 +113,9 @@ class PushBoxARPWorkspace(BaseWorkspace):
         _stop_at_epoch = int(getattr(cfg.training, "stop_at_epoch", 5000))
 
         if cfg.training.resume:
+            resume_optimizer = bool(
+                getattr(cfg.training, "resume_optimizer", True)
+            )
             resume_path = getattr(cfg.training, 'resume_path', None)
             if resume_path:
                 ckpt_path = pathlib.Path(resume_path)
@@ -133,7 +136,14 @@ class PushBoxARPWorkspace(BaseWorkspace):
                     payload['state_dicts'][sd_key] = clean_sd
                     if not all_norm_sd:
                         all_norm_sd = norm_sd
-                self.load_payload(payload)
+                self.load_payload(
+                    payload,
+                    exclude_keys=() if resume_optimizer else ("optimizer",),
+                )
+                if not resume_optimizer:
+                    # Keep the recovered model/EMA and epoch, but start the
+                    # fine-tuning optimizer and its schedule from the new config.
+                    self.optimizer_step = 0
                 # Restore cfg from CLI (checkpoint's cfg is stale)
                 self.cfg = cfg
                 # Re-capture after cfg restore to guard against OmegaConf deepcopy aliasing
@@ -199,7 +209,8 @@ class PushBoxARPWorkspace(BaseWorkspace):
             config=OmegaConf.to_container(cfg, resolve=True),
             **cfg.logging,
         )
-        wandb.config.update({"output_dir": self.output_dir})
+        # A resumed W&B run may continue in a new Hydra output directory.
+        wandb.config.update({"output_dir": self.output_dir}, allow_val_change=True)
         # Keep W&B's internal _step monotonic across fresh and resumed
         # processes. Training progress is tracked by the explicit global_step
         # metric instead of forcing _step to equal a checkpoint-local value.
@@ -361,9 +372,16 @@ class PushBoxARPWorkspace(BaseWorkspace):
                     if rollout_sr is not None:
                         step_log['rollout_sr'] = rollout_sr
                     metric_dict = {k.replace("/", "_"): v for k, v in step_log.items()}
-                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
-                    if topk_ckpt_path is not None:
-                        self.save_checkpoint(path=topk_ckpt_path)
+                    monitor_key = cfg.checkpoint.topk.monitor_key
+                    if monitor_key in metric_dict:
+                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                        if topk_ckpt_path is not None:
+                            self.save_checkpoint(path=topk_ckpt_path)
+                    else:
+                        print(
+                            f"Skipping top-k checkpoint at epoch {self.epoch}: "
+                            f"metric {monitor_key!r} is unavailable"
+                        )
 
                 wandb_run.log(step_log)
                 json_logger.log(step_log)

@@ -9,7 +9,8 @@ from hydra.utils import get_class
 from omegaconf import OmegaConf
 
 from envs.threading_env import needle_center_reaches_ring
-from threading_task.dataset import ThreadingImageDataset
+from threading_task.dataset import ThreadingImageDataset, real_robot_action_representation
+from threading_task.policy import ThreadingARPolicy
 from threading_task.env import (
     _environment_kwargs,
     agent_state_from_obs,
@@ -83,6 +84,41 @@ def test_threading_eef_dataset_schema(tmp_path):
     assert sample["obs"]["agent_pos"].shape == (10, 8)
     assert sample["obs"]["top45"].shape == (2, 3, 84, 84)
     assert dataset.get_normalizer()["agent_pos"].params_dict["scale"].shape == (8,)
+
+
+def test_real_robot_delta_action_representation():
+    state = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    next_state = np.array([[1.2, 1.5], [2.5, 4.5]], dtype=np.float32)
+    delta = real_robot_action_representation(next_state, state, "delta")
+    np.testing.assert_allclose(delta, [[0.2, -0.5], [-0.5, 0.5]], atol=1e-6)
+    np.testing.assert_array_equal(
+        real_robot_action_representation(next_state, state, "absolute"), next_state
+    )
+
+
+def test_threading_policy_extended_image_augmentation():
+    policy = ThreadingARPolicy(
+        shape_meta={
+            "action": {"shape": [8]},
+            "obs": {
+                "agent_pos": {"shape": [8], "type": "low_dim"},
+                "sideview": {"shape": [3, 16, 16], "type": "rgb"},
+                "wrist": {"shape": [3, 16, 16], "type": "rgb"},
+            },
+        },
+        horizon=2,
+        n_action_steps=2,
+        n_obs_steps=2,
+        pretrained=False,
+        image_augmentation={"hue": 0.05, "noise_std": 0.02, "translate": 0.1},
+        arp_cfg={"n_embd": 32, "num_layers": 1, "layer_cfg": {"n_head": 4, "mlp_ratio": 2, "AdaLN": True, "mlp_dropout": 0.0, "attn_kwargs": {}, "cond_attn_kwargs": {}}, "num_latents": 2},
+    )
+    policy.train()
+    image = torch.full((1, 2, 3, 16, 16), 0.5)
+    augmented = policy._augment_image_sequence(image)
+    assert augmented.shape == image.shape
+    assert torch.isfinite(augmented).all()
+    assert not torch.equal(augmented, image)
 
 
 def test_threading_three_camera_dataset_with_auxiliary_hdf5(tmp_path):

@@ -5,7 +5,7 @@ task:
   dataset:
     _target_: threading_task.dataset.ThreadingRealLeRobotDataset
     dataset_path: /home/tele/Thesis_project/Record_layer/data_lerobot_latest
-    horizon: 20
+    horizon: 21
     pad_before: 1
     pad_after: 7
     seed: 42
@@ -30,8 +30,8 @@ task:
       sideview: {shape: [3, 96, 96], type: rgb}
       wrist: {shape: [3, 96, 96], type: rgb}
 
-dataloader: {batch_size: 16, num_workers: 2, persistent_workers: true, pin_memory: true, shuffle: true}
-val_dataloader: {batch_size: 16, num_workers: 2, persistent_workers: true, pin_memory: true, shuffle: false}
+dataloader: {batch_size: 32, num_workers: 4, persistent_workers: true, pin_memory: true, prefetch_factor: 2, multiprocessing_context: spawn, shuffle: true}
+val_dataloader: {batch_size: 32, num_workers: 2, persistent_workers: true, pin_memory: true, prefetch_factor: 2, multiprocessing_context: spawn, shuffle: false}
 
 training:
   checkpoint_every: 5
@@ -51,7 +51,7 @@ training:
   seed: 42
   tqdm_interval_sec: 1.0
   use_ema: true
-  val_every: 10
+  val_every: 5
   stop_at_epoch: 150
 
 ema:
@@ -97,7 +97,7 @@ policy:
   obs_encoder_group_norm: true
   pretrained: true
   backbone: resnet18
-  freeze_obs_encoder: true
+  freeze_obs_encoder: false
   use_view_fusion: true
   horizon: 20
   n_action_steps: 20

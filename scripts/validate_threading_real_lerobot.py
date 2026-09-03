@@ -116,6 +116,7 @@ def _validate_v3(
                 repo_id="local/threading_real_validation",
                 root=root,
                 download_videos=False,
+                video_backend="pyav",
             )
         except Exception as exc:
             errors.append(f"official LeRobotDataset cannot load dataset: {exc}")

@@ -38,6 +38,24 @@ DEFAULT_REAL_CAMERA_KEYS = (
 DEFAULT_REAL_CAMERA_OUTPUT_KEYS = ("sideview", "wrist")
 
 
+def real_robot_action_representation(
+    absolute_actions: np.ndarray,
+    states: np.ndarray,
+    action_mode: str,
+) -> np.ndarray:
+    """Return real-robot labels as absolute targets or next-state deltas."""
+    if action_mode == "absolute":
+        return absolute_actions.astype(np.float32, copy=False)
+    if action_mode == "delta":
+        if absolute_actions.shape != states.shape:
+            raise ValueError(
+                f"absolute actions and states must match, got {absolute_actions.shape} and {states.shape}"
+            )
+        # The converted LeRobot action at row t is state[t + 1].
+        return (absolute_actions - states).astype(np.float32, copy=False)
+    raise ValueError(f"action_mode must be 'absolute' or 'delta', got {action_mode!r}")
+
+
 def sorted_demo_keys(data_group: h5py.Group) -> list[str]:
     """Return demo keys in numeric order while tolerating nonstandard names."""
 
@@ -481,8 +499,9 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
 
     Official LeRobot v3 data is reconstructed from its consolidated parquet
     shards and decoded through ``LeRobotDataset``. The previous episode-file
-    layout remains readable for backward compatibility. The real robot action
-    is next-frame joint position plus gripper width by default.
+    layout remains readable for backward compatibility. Source actions are
+    next-frame joint position plus gripper width; ``action_mode='delta'``
+    converts them to next-state minus current-state labels.
     """
 
     def __init__(
@@ -503,6 +522,7 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
         max_validation_sequences: int | None = None,
         state_key: str = "observation.state",
         action_key: str = "action",
+        action_mode: str = "absolute",
         max_cached_video_episodes: int = 2,
     ):
         super().__init__()
@@ -533,6 +553,9 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
         self.seed = int(seed)
         self.state_key = state_key
         self.action_key = action_key
+        if action_mode not in {"absolute", "delta"}:
+            raise ValueError("action_mode must be 'absolute' or 'delta'")
+        self.action_mode = action_mode
         self.max_cached_video_episodes = max(int(max_cached_video_episodes), 0)
         self.max_validation_sequences = (
             None
@@ -613,8 +636,9 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
                 raise ValueError(f"{parquet_path}: empty state/action episode")
             if not np.isfinite(state).all() or not np.isfinite(action).all():
                 raise ValueError(f"{parquet_path}: state/action contains NaN or Inf")
-            self.states.append(state.astype(np.float32, copy=False))
-            self.actions.append(action.astype(np.float32, copy=False))
+            state = state.astype(np.float32, copy=False)
+            self.states.append(state)
+            self.actions.append(real_robot_action_representation(action, state, self.action_mode))
 
     def _read_v3_parquet_episodes(self, max_frames_per_ep: int | None) -> None:
         """Read v3 tabular shards and reconstruct episodes from their index columns."""
@@ -677,7 +701,7 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
             if not np.isfinite(state).all() or not np.isfinite(action).all():
                 raise ValueError(f"episode {episode_index}: state/action contains NaN or Inf")
             self.states.append(state)
-            self.actions.append(action)
+            self.actions.append(real_robot_action_representation(action, state, self.action_mode))
             self.dataset_row_indices.append(dataset_indices[rows])
 
     def _get_lerobot_dataset(self):
@@ -692,6 +716,7 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
                 repo_id="local/threading_real",
                 root=self.dataset_path,
                 download_videos=False,
+                video_backend="pyav",
             )
         return self._lerobot_dataset
 
