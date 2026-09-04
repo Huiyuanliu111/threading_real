@@ -94,6 +94,13 @@ def test_real_robot_delta_action_representation():
     np.testing.assert_array_equal(
         real_robot_action_representation(next_state, state, "absolute"), next_state
     )
+    cartesian_delta = np.array(
+        [[0.001, -0.002, 0.003, 0.01, 0.0, -0.01, 0.002]], dtype=np.float32
+    )
+    np.testing.assert_allclose(
+        real_robot_action_representation(cartesian_delta, state, "cartesian_delta"),
+        cartesian_delta,
+    )
 
 
 def test_threading_policy_extended_image_augmentation():

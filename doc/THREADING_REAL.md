@@ -129,7 +129,19 @@ targets with a first-point or adjacent-point jump above `0.15 rad` abort the
 rollout before that chunk is sent; smaller targets are additionally rate
 limited by `--max-first-delta` and `--max-step-delta`.
 
-`--move-to-training-start` first moves the follower at low speed to the common
-recorded start posture
-`[0.0282, -0.1471, -0.0009, -2.2778, -0.0127, 2.0894, 0.7897]` rad and opens
-the gripper. It is intentionally unavailable in dry-run mode.
+`--move-to-training-start` first moves the follower at low speed to the default
+evaluation posture captured from the follower on 2026-09-04:
+`[0.307272, 0.323924, -0.112529, -2.501686, -0.012559, 2.764401, 0.833281]`
+rad, then opens the gripper. Override it with `--training-start-q` when a
+different safe posture is required. It is intentionally unavailable in dry-run
+mode.
+
+### Cartesian-delta deployment
+
+`scripts/deploy_threading_real_cartesian.py` is for checkpoints trained with
+`action_mode: cartesian_delta`. It reads the live joint state, computes the
+`panda_hand_tcp` pose with the packaged URDF, integrates base-frame TCP deltas,
+and streams the resulting poses through TrackC (UDP port 9200 by default).
+The runner requires `pinocchio` in the policy environment. Run dry-run first;
+real execution additionally requires explicit `--workspace-min X Y Z` and
+`--workspace-max X Y Z` bounds.

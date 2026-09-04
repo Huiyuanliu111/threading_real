@@ -43,7 +43,12 @@ def real_robot_action_representation(
     states: np.ndarray,
     action_mode: str,
 ) -> np.ndarray:
-    """Return real-robot labels as absolute targets or next-state deltas."""
+    """Return real-robot labels in the requested representation.
+
+    ``cartesian_delta`` expects an already-converted dataset whose action field
+    is ``[dx, dy, dz, drotvec_x, drotvec_y, drotvec_z, dgripper]``. Cartesian
+    labels cannot be derived by subtracting the joint-space observation state.
+    """
     if action_mode == "absolute":
         return absolute_actions.astype(np.float32, copy=False)
     if action_mode == "delta":
@@ -53,7 +58,12 @@ def real_robot_action_representation(
             )
         # The converted LeRobot action at row t is state[t + 1].
         return (absolute_actions - states).astype(np.float32, copy=False)
-    raise ValueError(f"action_mode must be 'absolute' or 'delta', got {action_mode!r}")
+    if action_mode == "cartesian_delta":
+        return absolute_actions.astype(np.float32, copy=False)
+    raise ValueError(
+        "action_mode must be 'absolute', 'delta', or 'cartesian_delta', "
+        f"got {action_mode!r}"
+    )
 
 
 def sorted_demo_keys(data_group: h5py.Group) -> list[str]:
@@ -553,8 +563,10 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
         self.seed = int(seed)
         self.state_key = state_key
         self.action_key = action_key
-        if action_mode not in {"absolute", "delta"}:
-            raise ValueError("action_mode must be 'absolute' or 'delta'")
+        if action_mode not in {"absolute", "delta", "cartesian_delta"}:
+            raise ValueError(
+                "action_mode must be 'absolute', 'delta', or 'cartesian_delta'"
+            )
         self.action_mode = action_mode
         self.max_cached_video_episodes = max(int(max_cached_video_episodes), 0)
         self.max_validation_sequences = (

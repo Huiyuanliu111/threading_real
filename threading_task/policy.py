@@ -71,8 +71,10 @@ class ThreadingARPolicy(BaseImagePolicy):
         self.agent_state_dim = int(state_shape[0])
         if self.agent_state_dim < self.action_dim:
             raise ValueError("Threading state width must be at least the action width")
-        if action_mode not in {"absolute", "delta"}:
-            raise ValueError("action_mode must be 'absolute' or 'delta'")
+        if action_mode not in {"absolute", "delta", "cartesian_delta"}:
+            raise ValueError(
+                "action_mode must be 'absolute', 'delta', or 'cartesian_delta'"
+            )
         self.action_mode = action_mode
 
         self.rgb_keys = tuple(

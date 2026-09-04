@@ -40,9 +40,10 @@ PANDA_UPPER = np.array(
 )
 DEFAULT_SIDEVIEW_SERIAL = "233722072293"
 DEFAULT_WRIST_SERIAL = "233622071984"
-# All 100 recorded episodes start at this follower posture (dataset v3).
+# Default evaluation start captured from the follower on 2026-09-04.
+# Pass --training-start-q explicitly to use a different safe start posture.
 TRAINING_START_Q = np.array(
-    [0.0282, -0.1471, -0.0009, -2.2778, -0.0127, 2.0894, 0.7897],
+    [0.307272, 0.323924, -0.112529, -2.501686, -0.012559, 2.764401, 0.833281],
     dtype=np.float64,
 )
 
