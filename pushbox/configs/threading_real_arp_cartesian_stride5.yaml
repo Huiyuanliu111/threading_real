@@ -1,0 +1,20 @@
+# Train on future-5-frame cumulative TCP deltas. At deployment use policy_hz=6
+# and execute_steps=1, so one policy action spans the original 5-frame interval.
+defaults:
+  - threading_real_arp_cartesian_delta
+  - _self_
+
+name: threading_real_arp_cartesian_stride5
+
+task:
+  dataset:
+    dataset_path: /home/huiyuan/teleoperation/data/threading_lerobot_v3_cartesian_stride5
+
+policy:
+  # During training, 30% of samples receive no q/gripper context. Inference
+  # always uses the live robot state.
+  proprioception_dropout_prob: 0.30
+
+logging:
+  name: threading_real_arp_cartesian_stride5
+  tags: [threading_real, lerobot, real_robot, arp, cartesian_delta, stride5, frozen_visual]

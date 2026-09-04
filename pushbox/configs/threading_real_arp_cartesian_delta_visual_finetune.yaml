@@ -1,0 +1,36 @@
+# Stage 2: short, low-learning-rate full ResNet fine-tuning.
+# This must resume from a checkpoint produced by
+# threading_real_arp_cartesian_delta.yaml; it is incompatible with 8D joint
+# action checkpoints.
+defaults:
+  - threading_real_arp_cartesian_delta
+  - _self_
+
+name: threading_real_arp_cartesian_delta_visual_finetune
+
+training:
+  # Deliberately mandatory: never silently start this fine-tuning recipe from
+  # random action-head weights.
+  resume: true
+  resume_path: ???
+  resume_optimizer: false
+  # Run only ten additional epochs after the resumed checkpoint. num_epochs,
+  # rather than stop_at_epoch, limits this second stage.
+  num_epochs: 10
+  stop_at_epoch: 999999
+  val_every: 1
+  checkpoint_every: 1
+
+optimizer:
+  # Keep the action head adaptive while changing the pretrained visual trunk
+  # very slowly.
+  lr: 0.00001
+  obs_encoder_lr: 0.000001
+  obs_projection_lr: 0.00001
+
+logging:
+  name: threading_real_cartesian_visual_finetune
+  tags: [threading_real, lerobot, real_robot, arp, cartesian_delta, visual_finetune]
+
+policy:
+  freeze_obs_encoder: false

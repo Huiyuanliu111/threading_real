@@ -57,6 +57,7 @@ class ThreadingARPolicy(BaseImagePolicy):
         obs_encoder_group_norm: bool = True,
         use_view_fusion: bool = True,
         image_augmentation: dict[str, float] | None = None,
+        proprioception_dropout_prob: float = 0.0,
         action_mode: str = "absolute",
         arp_cfg: dict[str, Any] | None = None,
         **unused_kwargs,
@@ -76,6 +77,9 @@ class ThreadingARPolicy(BaseImagePolicy):
                 "action_mode must be 'absolute', 'delta', or 'cartesian_delta'"
             )
         self.action_mode = action_mode
+        self.proprioception_dropout_prob = float(proprioception_dropout_prob)
+        if not 0.0 <= self.proprioception_dropout_prob < 1.0:
+            raise ValueError("proprioception_dropout_prob must be in [0, 1)")
 
         self.rgb_keys = tuple(
             key for key, value in shape_meta["obs"].items() if value.get("type") == "rgb"
@@ -494,6 +498,16 @@ class ThreadingARPolicy(BaseImagePolicy):
             state.flatten(0, 1)
         ).reshape(batch_size, -1, self.agent_state_dim)
         state_context = normalized_state[:, : self.n_obs_steps]
+        # Drop whole q/gripper histories for a subset of training samples. A
+        # single mask per sample prevents the model from reconstructing the
+        # state from the adjacent observation frame, while inference always
+        # retains the measured robot state.
+        if training and self.proprioception_dropout_prob > 0.0:
+            keep = (
+                torch.rand((batch_size, 1, 1), device=device)
+                >= self.proprioception_dropout_prob
+            ).to(state_context.dtype)
+            state_context = state_context * keep
         visual_tokens = self._visual_tokens(images, state_context)
         if not training:
             self.last_chunk_features = visual_tokens.detach()
