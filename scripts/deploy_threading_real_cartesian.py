@@ -98,6 +98,76 @@ def integrate_cartesian_delta_chunk(
     }
 
 
+def cartesian_pose_error(current_T: np.ndarray, target_T: np.ndarray) -> tuple[float, float]:
+    """Return TCP translation (m) and rotation (rad) error."""
+    current_T = np.asarray(current_T, dtype=np.float64)
+    target_T = np.asarray(target_T, dtype=np.float64)
+    if current_T.shape != (4, 4) or target_T.shape != (4, 4):
+        raise ValueError("current and target TCP poses must be 4x4 matrices")
+    translation = float(np.linalg.norm(target_T[:3, 3] - current_T[:3, 3]))
+    rotation = float(
+        Rotation.from_matrix(target_T[:3, :3] @ current_T[:3, :3].T).magnitude()
+    )
+    return translation, rotation
+
+
+def wait_for_trackc_segment(
+    streamer: Any,
+    client: Any,
+    robot_model: Any,
+    target_T: np.ndarray,
+    *,
+    position_tolerance: float,
+    rotation_tolerance: float,
+    timeout: float,
+    settle_samples: int,
+    poll_hz: float,
+    stop_requested: Any,
+) -> dict[str, float | bool]:
+    """Wait until TrackC has sent the segment, then sample its actual tracking error."""
+    started = time.monotonic()
+    deadline = started + timeout
+    completed_samples = 0
+    last_translation = float("inf")
+    last_rotation = float("inf")
+    while not stop_requested():
+        with streamer.manager.lock:
+            segment_completed = streamer.manager.completed
+        state, info = client.get_latest_state(allow_stale=False)
+        if state is not None:
+            if state["arm_state"] == "ERROR":
+                raise RuntimeError("remote controller reports arm ERROR during synchronous wait")
+            current_T = client.get_tcp_pose_from_q(
+                robot_model, state["q"], frame_name="panda_hand_tcp"
+            )
+            last_translation, last_rotation = cartesian_pose_error(current_T, target_T)
+            completed_samples = completed_samples + 1 if segment_completed else 0
+            if completed_samples >= settle_samples:
+                return {
+                    "stopped": False,
+                    "elapsed": time.monotonic() - started,
+                    "translation_error": last_translation,
+                    "rotation_error": last_rotation,
+                    "within_tolerance": (
+                        last_translation <= position_tolerance
+                        and last_rotation <= rotation_tolerance
+                    ),
+                }
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "synchronous TrackC segment wait timed out: "
+                f"segment_completed={segment_completed}, robot_state={info}"
+            )
+        time.sleep(1.0 / poll_hz)
+    return {
+        "stopped": True,
+        "elapsed": time.monotonic() - started,
+        "translation_error": last_translation,
+        "rotation_error": last_rotation,
+        "within_tolerance": False,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Deploy a Cartesian-delta ThreadingReal checkpoint via TrackC")
     parser.add_argument("checkpoint", type=Path)
@@ -113,9 +183,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-hz", type=float, default=30.0)
     parser.add_argument("--execute-steps", type=int, default=20)
     parser.add_argument("--max-cycles", type=int, default=0)
+    parser.add_argument(
+        "--synchronous",
+        action="store_true",
+        help="wait until TrackC has completely sent the action chunk before the next observation/inference",
+    )
+    parser.add_argument("--sync-position-tolerance", type=float, default=0.001)
+    parser.add_argument("--sync-rotation-tolerance", type=float, default=0.02)
+    parser.add_argument("--sync-timeout", type=float, default=2.0)
+    parser.add_argument("--sync-settle-samples", type=int, default=3)
+    parser.add_argument("--sync-poll-hz", type=float, default=50.0)
     parser.add_argument("--sideview-serial", default=DEFAULT_SIDEVIEW_SERIAL)
     parser.add_argument("--wrist-serial", default=DEFAULT_WRIST_SERIAL)
-    parser.add_argument("--image-size", type=int, default=96)
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=None,
+        help="policy input size; defaults to the checkpoint image shape",
+    )
+    parser.add_argument(
+        "--pre-resize-image-size",
+        type=int,
+        default=None,
+        help="optionally downsample live RGB here before resizing to policy input size",
+    )
     parser.add_argument("--camera-timeout-ms", type=int, default=1000)
     parser.add_argument("--state-timeout", type=float, default=2.0)
     parser.add_argument("--cartesian-stiffness", type=float, nargs=6, default=[200, 200, 200, 15, 15, 15])
@@ -156,6 +247,18 @@ def run(args: argparse.Namespace) -> int:
         raise ImportError("Cartesian deployment requires pinocchio; install it in pushbox with `conda install -c conda-forge pinocchio`") from exc
     if args.execute != args.confirm_real_robot:
         raise ValueError("real execution requires both --execute and --confirm-real-robot")
+    if args.synchronous and not args.execute:
+        raise ValueError("--synchronous requires --execute")
+    if args.policy_hz <= 0 or args.stream_hz <= 0:
+        raise ValueError("--policy-hz and --stream-hz must be positive")
+    if (
+        args.sync_position_tolerance <= 0
+        or args.sync_rotation_tolerance <= 0
+        or args.sync_timeout <= 0
+        or args.sync_settle_samples <= 0
+        or args.sync_poll_hz <= 0
+    ):
+        raise ValueError("synchronous wait settings must be positive")
     if (args.workspace_min is None) != (args.workspace_max is None):
         raise ValueError("provide both --workspace-min and --workspace-max, or neither")
     workspace_min = None if args.workspace_min is None else np.asarray(args.workspace_min, dtype=float)
@@ -174,8 +277,17 @@ def run(args: argparse.Namespace) -> int:
     policy = load_policy(str(args.checkpoint.expanduser()), device=args.device, weights=args.weights, use_checkpoint_config=True)
     if getattr(policy, "action_mode", None) != "cartesian_delta" or int(policy.action_dim) != 7:
         raise ValueError("checkpoint must be a 7D cartesian_delta policy")
+    if args.image_size is None:
+        args.image_size = int(policy.image_shape[-1])
+    if args.image_size <= 0:
+        raise ValueError("--image-size must be positive")
+    if args.pre_resize_image_size is not None and args.pre_resize_image_size <= 0:
+        raise ValueError("--pre-resize-image-size must be positive")
     if args.execute_steps <= 0 or args.execute_steps > int(policy.horizon):
         raise ValueError("--execute-steps must be in [1, checkpoint horizon]")
+    period = args.execute_steps / args.policy_hz
+    if args.synchronous and args.sync_timeout <= period:
+        raise ValueError("--sync-timeout must exceed execute_steps / policy_hz")
     policy.n_action_steps = args.execute_steps
     if hasattr(policy, "set_prediction_mode"):
         policy.set_prediction_mode("full_then_truncate")
@@ -210,20 +322,20 @@ def run(args: argparse.Namespace) -> int:
         for _ in range(int(policy.n_obs_steps)):
             side, wrist = cameras.read(args.camera_timeout_ms); state, info = client.get_latest_state(allow_stale=False)
             if state is None: raise RuntimeError(f"robot state unavailable during warmup: {info}")
-            history.append(make_observation(side, wrist, state["q"], client.get_gripper_width(), args.image_size)); time.sleep(1 / args.policy_hz)
+            history.append(make_observation(side, wrist, state["q"], client.get_gripper_width(), args.image_size, args.pre_resize_image_size)); time.sleep(1 / args.policy_hz)
         samples = max(1, round(args.stream_hz / args.policy_hz))
         T_start = client.get_tcp_pose_from_q(robot_model, state["q"], frame_name="panda_hand_tcp")
         if args.execute:
             streamer = client.create_trackc_streamer(command_ip=args.server_ip, command_port=args.command_port, stream_hz=args.stream_hz, samples_per_segment=samples)
             streamer.start(T_start, cartesian_stiffness(args.cartesian_stiffness), args.nullspace_stiffness)
             print(f"[runner] TrackC UDP target={args.server_ip}:{args.command_port} stream_hz={args.stream_hz}")
-        print(f"[runner] mode={'EXECUTE' if args.execute else 'DRY-RUN'} n_obs_steps={policy.n_obs_steps} execute_steps={args.execute_steps} samples_per_segment={samples}")
-        cycle = 0; next_cycle = time.monotonic(); period = args.execute_steps / args.policy_hz
+        print(f"[runner] mode={'EXECUTE' if args.execute else 'DRY-RUN'} synchronous={args.synchronous} n_obs_steps={policy.n_obs_steps} execute_steps={args.execute_steps} samples_per_segment={samples}")
+        cycle = 0; next_cycle = time.monotonic()
         while not stop and (args.max_cycles == 0 or cycle < args.max_cycles):
             side, wrist = cameras.read(args.camera_timeout_ms); state, info = client.get_latest_state(allow_stale=False)
             if state is None: raise RuntimeError(f"fresh robot state unavailable: {info}")
             if state["arm_state"] == "ERROR": raise RuntimeError("remote controller reports arm ERROR")
-            width = client.get_gripper_width(); history.append(make_observation(side, wrist, state["q"], width, args.image_size))
+            width = client.get_gripper_width(); history.append(make_observation(side, wrist, state["q"], width, args.image_size, args.pre_resize_image_size))
             with torch.inference_mode(): raw = policy.predict_action(stack_observations(history, args.device))["action"][0].detach().cpu().numpy()
             if (
                 np.max(np.linalg.norm(raw[:, :3], axis=1)) > args.abort_translation
@@ -232,8 +344,37 @@ def run(args: argparse.Namespace) -> int:
                 raise RuntimeError("unsafe raw Cartesian action in predicted chunk")
             T_now = client.get_tcp_pose_from_q(robot_model, state["q"], frame_name="panda_hand_tcp")
             poses, widths, stats = integrate_cartesian_delta_chunk(raw, T_now, width, max_first_translation=args.max_first_translation, max_step_translation=args.max_step_translation, max_first_rotation=args.max_first_rotation, max_step_rotation=args.max_step_rotation, workspace_min=workspace_min, workspace_max=workspace_max)
-            if streamer is not None: streamer.update_waypoints(poses, merge_mode="replace"); gripper.update(float(widths[-1]))
-            cycle += 1; print(f"[runner] cycle={cycle} state_age={info['age']:.4f}s raw_dxyz={stats['raw_first_translation']*1000:.2f}mm safe_dxyz={stats['safe_first_translation']*1000:.2f}mm raw_drot={np.degrees(stats['raw_first_rotation']):.2f}deg gripper={widths[-1]:.4f}m")
+            sync_result = None
+            if streamer is not None:
+                streamer.update_waypoints(poses, merge_mode="replace")
+                gripper.update(float(widths[-1]))
+                if args.synchronous:
+                    sync_result = wait_for_trackc_segment(
+                        streamer,
+                        client,
+                        robot_model,
+                        poses[-1],
+                        position_tolerance=args.sync_position_tolerance,
+                        rotation_tolerance=args.sync_rotation_tolerance,
+                        timeout=args.sync_timeout,
+                        settle_samples=args.sync_settle_samples,
+                        poll_hz=args.sync_poll_hz,
+                        stop_requested=lambda: stop,
+                    )
+                    if sync_result["stopped"]:
+                        break
+            cycle += 1
+            sync_text = ""
+            if sync_result is not None:
+                sync_text = (
+                    f" sync_time={sync_result['elapsed']:.3f}s"
+                    f" sync_xyz_err={sync_result['translation_error'] * 1000:.2f}mm"
+                    f" sync_rot_err={np.degrees(sync_result['rotation_error']):.2f}deg"
+                    f" sync_target={sync_result['within_tolerance']}"
+                )
+            print(f"[runner] cycle={cycle} state_age={info['age']:.4f}s raw_dxyz={stats['raw_first_translation']*1000:.2f}mm safe_dxyz={stats['safe_first_translation']*1000:.2f}mm raw_drot={np.degrees(stats['raw_first_rotation']):.2f}deg gripper={widths[-1]:.4f}m{sync_text}")
+            if args.synchronous:
+                continue
             next_cycle += period; remaining = next_cycle-time.monotonic()
             if remaining > 0: time.sleep(remaining)
             else: print(f"[runner] warning: inference overran replan period by {-remaining:.3f}s"); next_cycle=time.monotonic()

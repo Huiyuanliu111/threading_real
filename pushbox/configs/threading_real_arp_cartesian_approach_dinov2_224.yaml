@@ -1,0 +1,40 @@
+# Stage-1 visual-localization experiment using true 224x224 source videos and
+# all 16x16 DINOv2 patch tokens. The dataset must be built from the original
+# 640x480 trimmed recordings; upsampling the existing 96x96 dataset is invalid.
+defaults:
+  - threading_real_arp_cartesian_approach_stage1
+  - _self_
+
+name: threading_real_arp_cartesian_approach_dinov2_224
+
+task:
+  dataset:
+    dataset_path: /home/huiyuan/teleoperation/data/threading_lerobot_v3_cartesian_stride5_224
+    image_size: 224
+  image_shape: [3, 224, 224]
+  name: threading_real_cartesian_approach_dinov2_224
+  shape_meta: &shape_meta
+    action: {shape: [7]}
+    obs:
+      agent_pos: {shape: [8], type: low_dim}
+      sideview: {shape: [3, 224, 224], type: rgb}
+      wrist: {shape: [3, 224, 224], type: rgb}
+
+policy:
+  shape_meta: *shape_meta
+  backbone: vit_small_patch14_dinov2
+  pretrained: true
+  freeze_obs_encoder: true
+  # DINOv2 produces 256 tokens per camera per observation. Increase the
+  # policy width, but keep the backbone frozen for the first controlled run.
+  arp_cfg:
+    n_embd: 256
+
+optimizer:
+  lr: 0.0001
+  obs_encoder_lr: 0.000001
+  obs_projection_lr: 0.0001
+
+logging:
+  name: threading_real_arp_cartesian_approach_dinov2_224
+  tags: [threading_real, real_robot, approach_stage1, cartesian_delta, stride5, dinov2, 224px]

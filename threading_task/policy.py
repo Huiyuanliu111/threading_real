@@ -13,6 +13,11 @@ import torchvision.models as tv_models
 import torchvision.transforms.functional as tv_functional
 from torchvision.transforms import InterpolationMode
 
+try:
+    import timm
+except ImportError:  # pragma: no cover - exercised only in minimal installs
+    timm = None
+
 from pushbox import arp
 from chunk_selector.chunk_selector import ChunkSelection, ChunkSelector
 from chunk_selector.execution import (
@@ -96,27 +101,62 @@ class ThreadingARPolicy(BaseImagePolicy):
         if self.camera_obs_keys is not None and len(self.camera_obs_keys) != len(self.rgb_keys):
             raise ValueError("camera_obs_keys must contain one environment key per RGB input")
 
-        backbone_options = {
+        resnet_options = {
             "resnet18": (tv_models.resnet18, tv_models.ResNet18_Weights.IMAGENET1K_V1),
             "resnet34": (tv_models.resnet34, tv_models.ResNet34_Weights.IMAGENET1K_V1),
             "resnet50": (tv_models.resnet50, tv_models.ResNet50_Weights.IMAGENET1K_V1),
         }
-        if backbone not in backbone_options:
-            raise ValueError(f"backbone must be one of {sorted(backbone_options)}, got {backbone!r}")
-        backbone_builder, pretrained_weights = backbone_options[backbone]
-        resnet = backbone_builder(weights=pretrained_weights if pretrained else None)
         self.backbone = backbone
-        if obs_encoder_group_norm:
-            replace_submodules(
-                root_module=resnet,
-                predicate=lambda module: isinstance(module, nn.BatchNorm2d),
-                func=lambda module: nn.GroupNorm(
-                    num_groups=module.num_features // 16,
-                    num_channels=module.num_features,
-                ),
+        if backbone in resnet_options:
+            backbone_builder, pretrained_weights = resnet_options[backbone]
+            resnet = backbone_builder(weights=pretrained_weights if pretrained else None)
+            if obs_encoder_group_norm:
+                replace_submodules(
+                    root_module=resnet,
+                    predicate=lambda module: isinstance(module, nn.BatchNorm2d),
+                    func=lambda module: nn.GroupNorm(
+                        num_groups=module.num_features // 16,
+                        num_channels=module.num_features,
+                    ),
+                )
+            self.obs_encoder = nn.Sequential(*list(resnet.children())[:-2])
+            self.obs_feature_dim = int(resnet.fc.in_features)
+            self.encoder_kind = "resnet"
+            # ResNet output stride is 32. Allocate one extra position so odd
+            # input sizes remain usable as well.
+            max_height = max(shape[1] for shape in self.image_shapes.values())
+            max_width = max(shape[2] for shape in self.image_shapes.values())
+            max_grid_height = math.ceil(max_height / 32)
+            max_grid_width = math.ceil(max_width / 32)
+        elif backbone == "vit_small_patch14_dinov2":
+            if timm is None:
+                raise ImportError(
+                    "timm is required for the DINOv2 visual backbone; install timm>=1.0"
+                )
+            input_sizes = {
+                (shape[1], shape[2]) for shape in self.image_shapes.values()
+            }
+            if len(input_sizes) != 1:
+                raise ValueError(
+                    "DINOv2 currently requires all camera inputs to have one shared size"
+                )
+            image_height, image_width = next(iter(input_sizes))
+            if image_height != image_width or image_height % 14:
+                raise ValueError(
+                    "vit_small_patch14_dinov2 requires a square image size divisible by 14"
+                )
+            self.obs_encoder = timm.create_model(
+                backbone,
+                pretrained=pretrained,
+                img_size=image_height,
+                num_classes=0,
             )
-        self.obs_encoder = nn.Sequential(*list(resnet.children())[:-2])
-        self.obs_feature_dim = int(resnet.fc.in_features)
+            self.obs_feature_dim = int(self.obs_encoder.num_features)
+            self.encoder_kind = "dinov2"
+            max_grid_height, max_grid_width = self.obs_encoder.patch_embed.grid_size
+        else:
+            supported = sorted((*resnet_options, "vit_small_patch14_dinov2"))
+            raise ValueError(f"backbone must be one of {supported}, got {backbone!r}")
         self.freeze_obs_encoder = bool(freeze_obs_encoder)
         if self.freeze_obs_encoder:
             self.obs_encoder.requires_grad_(False)
@@ -227,8 +267,8 @@ class ThreadingARPolicy(BaseImagePolicy):
             {
                 "camera": nn.Embedding(len(self.rgb_keys), n_embd),
                 "time": nn.Embedding(self.n_obs_steps, n_embd),
-                "row": nn.Embedding(8, n_embd),
-                "column": nn.Embedding(8, n_embd),
+                "row": nn.Embedding(max_grid_height, n_embd),
+                "column": nn.Embedding(max_grid_width, n_embd),
             }
         )
         for embedding in self.visual_token_embeddings.values():
@@ -368,9 +408,26 @@ class ThreadingARPolicy(BaseImagePolicy):
             if image.shape[:2] != (batch_size, obs_steps):
                 raise ValueError(f"Camera {key} has inconsistent batch/time shape {image.shape}")
             _, _, channels, height, width = image.shape
-            feature = self.obs_projection(
-                self.obs_encoder(image.reshape(-1, channels, height, width))
-            )
+            flat_image = image.reshape(-1, channels, height, width)
+            if self.encoder_kind == "dinov2":
+                encoded = self.obs_encoder.forward_features(flat_image)
+                if encoded.ndim != 3:
+                    raise ValueError(
+                        f"DINOv2 returned unexpected feature shape {encoded.shape}"
+                    )
+                prefix_tokens = int(self.obs_encoder.num_prefix_tokens)
+                encoded = encoded[:, prefix_tokens:]
+                grid_height, grid_width = self.obs_encoder.patch_embed.grid_size
+                if encoded.shape[1] != grid_height * grid_width:
+                    raise ValueError(
+                        "DINOv2 patch-token count does not match its spatial grid"
+                    )
+                encoded = encoded.transpose(1, 2).reshape(
+                    -1, self.obs_feature_dim, grid_height, grid_width
+                )
+            else:
+                encoded = self.obs_encoder(flat_image)
+            feature = self.obs_projection(encoded)
             grid_height, grid_width = feature.shape[-2:]
             if (
                 grid_height > self.visual_token_embeddings["row"].num_embeddings
@@ -379,7 +436,7 @@ class ThreadingARPolicy(BaseImagePolicy):
             ):
                 raise ValueError(
                     f"Visual grid {(grid_height, grid_width)} exceeds the "
-                    "supported 8x8 positional embedding"
+                    "configured positional embedding"
                 )
             num_spatial = grid_height * grid_width
             feature = feature.flatten(2).transpose(1, 2).reshape(

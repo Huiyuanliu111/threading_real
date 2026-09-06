@@ -104,3 +104,17 @@ def test_stack_observations_has_policy_shapes() -> None:
     assert obs["sideview"].shape == (1, 2, 3, 96, 96)
     assert obs["wrist"].shape == (1, 2, 3, 96, 96)
     assert obs["agent_pos"].shape == (1, 2, 8)
+
+
+def test_make_observation_supports_training_resolution_replay() -> None:
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    frame = runner.make_observation(
+        image,
+        image,
+        np.zeros(7),
+        0.08,
+        image_size=224,
+        pre_resize_image_size=96,
+    )
+    assert frame.sideview.shape == (3, 224, 224)
+    assert frame.wrist.shape == (3, 224, 224)

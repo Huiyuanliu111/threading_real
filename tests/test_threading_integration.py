@@ -9,7 +9,12 @@ from hydra.utils import get_class
 from omegaconf import OmegaConf
 
 from envs.threading_env import needle_center_reaches_ring
-from threading_task.dataset import ThreadingImageDataset, real_robot_action_representation
+from threading_task.dataset import (
+    ThreadingImageDataset,
+    _build_sample_indices,
+    long_wait_drop_mask,
+    real_robot_action_representation,
+)
 from threading_task.policy import ThreadingARPolicy
 from threading_task.env import (
     _environment_kwargs,
@@ -103,6 +108,50 @@ def test_real_robot_delta_action_representation():
     )
 
 
+def test_temporal_stride_sample_indices() -> None:
+    indices = _build_sample_indices(
+        lengths=np.array([21]),
+        episode_mask=np.array([True]),
+        horizon=4,
+        pad_before=1,
+        pad_after=1,
+        temporal_stride=5,
+    )
+    assert indices[0].tolist() == [0, -5]
+    assert indices[-1].tolist() == [0, 10]
+
+
+def test_long_wait_filter_only_drops_sustained_run_interior() -> None:
+    actions = np.zeros((12, 7), dtype=np.float32)
+    actions[:2, 0] = 0.01
+    actions[-2:, 0] = 0.01
+    drop = long_wait_drop_mask(
+        actions,
+        translation_threshold=0.001,
+        rotation_threshold=0.01,
+        gripper_threshold=0.0005,
+        min_run_frames=6,
+        keep_boundary_frames=2,
+    )
+    np.testing.assert_array_equal(
+        np.flatnonzero(drop),
+        np.array([4, 5, 6, 7]),
+    )
+
+
+def test_long_wait_filter_keeps_short_stationary_run() -> None:
+    actions = np.zeros((5, 7), dtype=np.float32)
+    drop = long_wait_drop_mask(
+        actions,
+        translation_threshold=0.001,
+        rotation_threshold=0.01,
+        gripper_threshold=0.0005,
+        min_run_frames=6,
+        keep_boundary_frames=1,
+    )
+    assert not drop.any()
+
+
 def test_threading_policy_extended_image_augmentation():
     policy = ThreadingARPolicy(
         shape_meta={
@@ -126,6 +175,49 @@ def test_threading_policy_extended_image_augmentation():
     assert augmented.shape == image.shape
     assert torch.isfinite(augmented).all()
     assert not torch.equal(augmented, image)
+
+
+def test_threading_dinov2_preserves_all_spatial_patch_tokens():
+    policy = ThreadingARPolicy(
+        shape_meta={
+            "action": {"shape": [7]},
+            "obs": {
+                "agent_pos": {"shape": [8], "type": "low_dim"},
+                "sideview": {"shape": [3, 224, 224], "type": "rgb"},
+                "wrist": {"shape": [3, 224, 224], "type": "rgb"},
+            },
+        },
+        horizon=2,
+        n_action_steps=1,
+        n_obs_steps=2,
+        backbone="vit_small_patch14_dinov2",
+        pretrained=False,
+        freeze_obs_encoder=True,
+        arp_cfg={
+            "n_embd": 32,
+            "num_layers": 1,
+            "layer_cfg": {
+                "n_head": 4,
+                "mlp_ratio": 2,
+                "AdaLN": True,
+                "mlp_dropout": 0.0,
+                "attn_kwargs": {},
+                "cond_attn_kwargs": {},
+            },
+            "num_latents": 1,
+        },
+    )
+    images = {
+        key: torch.zeros(1, 2, 3, 224, 224)
+        for key in ("sideview", "wrist")
+    }
+    with torch.no_grad():
+        tokens = policy._visual_tokens(images, torch.zeros(1, 2, 8))
+
+    # 224 / 14 = 16 patches per axis, for two frames and two cameras.
+    assert tokens.shape == (1, 2 * 2 * 16 * 16, 32)
+    assert policy.visual_token_embeddings["row"].num_embeddings == 16
+    assert policy.visual_token_embeddings["column"].num_embeddings == 16
 
 
 def test_threading_three_camera_dataset_with_auxiliary_hdf5(tmp_path):

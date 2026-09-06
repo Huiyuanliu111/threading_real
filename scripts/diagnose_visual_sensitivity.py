@@ -71,7 +71,9 @@ def main() -> int:
         # Fixed q/gripper; only RGB histories are replaced.
         obs = {**image_obs, "agent_pos": base["agent_pos"]}
         action = first_action(policy, obs, args.device)
-        label = image_sample["action"][0]
+        # Training begins imitation at the newest observation, not the oldest
+        # frame in the observation history.
+        label = image_sample["action"][int(policy.n_obs_steps) - 1]
         records.append({
             "image_episode": episode,
             "predicted_action": action.astype(float).tolist(),

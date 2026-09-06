@@ -1,0 +1,107 @@
+# Stage 1: learn only the visual approach to the block.
+# The source labels are t -> t+5 Cartesian deltas. temporal_stride=5 also
+# samples observations and future action targets every five 30 Hz frames.
+defaults:
+  - threading_real_arp_cartesian_delta
+  - _self_
+
+name: threading_real_arp_cartesian_approach_stage1
+
+task:
+  dataset:
+    dataset_path: /home/huiyuan/teleoperation/data/threading_lerobot_v3_cartesian_stride5
+    temporal_stride: 5
+    episode_end_fraction: 0.20
+    drop_waiting: true
+    wait_translation_threshold: 0.001
+    wait_rotation_threshold: 0.01
+    wait_gripper_threshold: 0.0005
+    wait_min_run_frames: 15
+    wait_keep_boundary_frames: 2
+    horizon: 11
+    pad_before: 1
+    pad_after: 3
+    image_size: 224
+  image_shape: [3, 224, 224]
+  name: threading_real_cartesian_approach_stage1
+  shape_meta: &shape_meta
+    action: {shape: [7]}
+    obs:
+      agent_pos: {shape: [8], type: low_dim}
+      sideview: {shape: [3, 224, 224], type: rgb}
+      wrist: {shape: [3, 224, 224], type: rgb}
+
+dataloader:
+  batch_size: 8
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+  multiprocessing_context: spawn
+  shuffle: true
+
+val_dataloader:
+  batch_size: 8
+  num_workers: 2
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+  multiprocessing_context: spawn
+  shuffle: false
+
+training:
+  gradient_accumulate_every: 8
+  lr_warmup_steps: 500
+  num_epochs: 80
+  stop_at_epoch: 80
+  max_val_steps: null
+  val_every: 5
+  checkpoint_every: 5
+
+optimizer:
+  lr: 0.0001
+  obs_encoder_lr: 0.000003
+  obs_projection_lr: 0.0001
+
+policy:
+  shape_meta: *shape_meta
+  backbone: resnet34
+  pretrained: true
+  freeze_obs_encoder: false
+  horizon: 10
+  n_action_steps: 1
+  n_obs_steps: 2
+  proprioception_dropout_prob: 0.10
+  image_augmentation:
+    brightness: 0.10
+    contrast: 0.10
+    saturation: 0.05
+    hue: 0.0
+    noise_std: 0.005
+    translate: 0.0
+  arp_cfg:
+    plan_steps: 0
+    plan_chunk_size: 1
+    action_chunk_size: 10
+    num_latents: 1
+    action_predictor: regression
+    action_predictor_kwargs:
+      loss: smooth_l1
+      beta: 0.1
+    layer_norm_every_block: false
+    n_embd: 128
+    embd_pdrop: 0.1
+    num_layers: 8
+    layer_cfg:
+      n_head: 8
+      mlp_ratio: 4.0
+      AdaLN: true
+      mlp_dropout: 0.1
+      attn_kwargs: {attn_pdrop: 0.1, resid_pdrop: 0.1}
+      cond_attn_kwargs: {attn_pdrop: 0.1, resid_pdrop: 0.1}
+    sample: false
+    low_var_eval: true
+
+logging:
+  name: threading_real_arp_cartesian_approach_stage1
+  tags: [threading_real, real_robot, approach_stage1, cartesian_delta, stride5, resnet34, visual_finetune]

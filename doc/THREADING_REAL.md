@@ -145,3 +145,30 @@ and streams the resulting poses through TrackC (UDP port 9200 by default).
 The runner requires `pinocchio` in the policy environment. Run dry-run first;
 real execution additionally requires explicit `--workspace-min X Y Z` and
 `--workspace-max X Y Z` bounds.
+
+Add `--synchronous` for strict observe-infer-act synchronization. In this mode,
+the runner sends one predicted action chunk, waits until TrackC has sent every
+interpolated sample in that chunk, then captures the next observation.
+`--policy-hz` therefore defines the duration of each action step rather than
+forcing inference at a fixed wall-clock rate. Since TrackC is an impedance
+controller, measured TCP target error is logged but does not block the next
+cycle. Its diagnostic thresholds can be adjusted with
+`--sync-position-tolerance` and `--sync-rotation-tolerance`; `--sync-timeout`
+only detects a TrackC stream that failed to finish its segment.
+
+### Approach-only Stage 1
+
+`threading_real_arp_cartesian_approach_stage1.yaml` trains only on the first
+20% of each demonstration. It uses the cumulative five-frame Cartesian labels
+and also samples observation/action sequences every five source frames. The
+visual input is 224x224, the pretrained ResNet34 is fine-tuned, and a
+deterministic Smooth-L1 action head is used to make action direction easier to
+diagnose than with a multi-modal GMM. Sustained stationary runs are masked from
+sampling and action loss while their boundary frames are retained; short pauses
+and genuine corrective motion are left unchanged.
+
+```bash
+python pushbox/train.py \
+  --config-name threading_real_arp_cartesian_approach_stage1 \
+  hydra.run.dir=outputs/threading_real_cartesian_approach_stage1
+```

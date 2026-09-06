@@ -265,12 +265,27 @@ def make_observation(
     q: Sequence[float],
     gripper_width: float,
     image_size: int,
+    pre_resize_image_size: int | None = None,
 ) -> ObservationFrame:
     state = np.concatenate(
         [np.asarray(q, dtype=np.float32), np.asarray([gripper_width], dtype=np.float32)]
     )
     if state.shape != (8,) or not np.all(np.isfinite(state)):
         raise ValueError(f"invalid 8D robot state: {state}")
+    if pre_resize_image_size is not None:
+        pre_resize_image_size = int(pre_resize_image_size)
+        if pre_resize_image_size <= 0:
+            raise ValueError("pre_resize_image_size must be positive")
+        sideview_rgb = cv2.resize(
+            sideview_rgb,
+            (pre_resize_image_size, pre_resize_image_size),
+            interpolation=cv2.INTER_AREA,
+        )
+        wrist_rgb = cv2.resize(
+            wrist_rgb,
+            (pre_resize_image_size, pre_resize_image_size),
+            interpolation=cv2.INTER_AREA,
+        )
     return ObservationFrame(
         sideview=image_to_policy_tensor(sideview_rgb, image_size),
         wrist=image_to_policy_tensor(wrist_rgb, image_size),

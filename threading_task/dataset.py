@@ -163,15 +163,24 @@ def _build_sample_indices(
     horizon: int,
     pad_before: int,
     pad_after: int,
+    temporal_stride: int = 1,
 ) -> np.ndarray:
     rows: list[tuple[int, int]] = []
+    temporal_stride = int(temporal_stride)
+    if temporal_stride <= 0:
+        raise ValueError("temporal_stride must be positive")
     pad_before = min(max(int(pad_before), 0), horizon - 1)
     pad_after = min(max(int(pad_after), 0), horizon - 1)
     for episode_index, length in enumerate(lengths):
         if not episode_mask[episode_index]:
             continue
-        min_start = -pad_before
-        max_start = int(length) - horizon + pad_after
+        min_start = -pad_before * temporal_stride
+        max_start = (
+            int(length)
+            - 1
+            - (horizon - 1) * temporal_stride
+            + pad_after * temporal_stride
+        )
         rows.extend((episode_index, start) for start in range(min_start, max_start + 1))
     if not rows:
         selected = lengths[episode_mask]
@@ -181,6 +190,46 @@ def _build_sample_indices(
             f"selected episode lengths={selected.tolist()}"
         )
     return np.asarray(rows, dtype=np.int64)
+
+
+def long_wait_drop_mask(
+    actions: np.ndarray,
+    *,
+    translation_threshold: float,
+    rotation_threshold: float,
+    gripper_threshold: float,
+    min_run_frames: int,
+    keep_boundary_frames: int,
+) -> np.ndarray:
+    """Mark interiors of sustained stationary Cartesian-action runs for removal."""
+    actions = np.asarray(actions)
+    if actions.ndim != 2 or actions.shape[1] != ACTION_DIM:
+        raise ValueError(f"expected Nx{ACTION_DIM} Cartesian actions, got {actions.shape}")
+    thresholds = np.asarray(
+        [translation_threshold, rotation_threshold, gripper_threshold], dtype=float
+    )
+    if not np.all(np.isfinite(thresholds)) or np.any(thresholds < 0):
+        raise ValueError("wait thresholds must be finite and non-negative")
+    min_run_frames = int(min_run_frames)
+    keep_boundary_frames = int(keep_boundary_frames)
+    if min_run_frames <= 0 or keep_boundary_frames < 0:
+        raise ValueError("wait run length must be positive and boundary must be non-negative")
+
+    stationary = (
+        (np.linalg.norm(actions[:, :3], axis=1) <= translation_threshold)
+        & (np.linalg.norm(actions[:, 3:6], axis=1) <= rotation_threshold)
+        & (np.abs(actions[:, 6]) <= gripper_threshold)
+    )
+    padded = np.pad(stationary.astype(np.int8), (1, 1))
+    transitions = np.flatnonzero(np.diff(padded))
+    drop = np.zeros(len(actions), dtype=bool)
+    for start, end in transitions.reshape(-1, 2):
+        if end - start < min_run_frames:
+            continue
+        interior_start = min(start + keep_boundary_frames, end)
+        interior_end = max(end - keep_boundary_frames, interior_start)
+        drop[interior_start:interior_end] = True
+    return drop
 
 
 class ThreadingImageDataset(BaseImageDataset):
@@ -534,6 +583,14 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
         action_key: str = "action",
         action_mode: str = "absolute",
         max_cached_video_episodes: int = 2,
+        temporal_stride: int = 1,
+        episode_end_fraction: float = 1.0,
+        drop_waiting: bool = False,
+        wait_translation_threshold: float = 0.001,
+        wait_rotation_threshold: float = 0.01,
+        wait_gripper_threshold: float = 0.0005,
+        wait_min_run_frames: int = 15,
+        wait_keep_boundary_frames: int = 2,
     ):
         super().__init__()
         path = Path(dataset_path).expanduser().resolve()
@@ -569,6 +626,20 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
             )
         self.action_mode = action_mode
         self.max_cached_video_episodes = max(int(max_cached_video_episodes), 0)
+        self.temporal_stride = int(temporal_stride)
+        if self.temporal_stride <= 0:
+            raise ValueError("temporal_stride must be positive")
+        self.episode_end_fraction = float(episode_end_fraction)
+        if not 0.0 < self.episode_end_fraction <= 1.0:
+            raise ValueError("episode_end_fraction must be in (0, 1]")
+        self.drop_waiting = bool(drop_waiting)
+        self.wait_filter_kwargs = {
+            "translation_threshold": float(wait_translation_threshold),
+            "rotation_threshold": float(wait_rotation_threshold),
+            "gripper_threshold": float(wait_gripper_threshold),
+            "min_run_frames": int(wait_min_run_frames),
+            "keep_boundary_frames": int(wait_keep_boundary_frames),
+        }
         self.max_validation_sequences = (
             None
             if max_validation_sequences is None
@@ -605,6 +676,18 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
             self._read_v3_parquet_episodes(max_frames_per_ep)
         else:
             self._read_parquet_episodes(max_frames_per_ep)
+        if self.episode_end_fraction < 1.0:
+            for episode_index in range(len(self.states)):
+                stop = max(
+                    1,
+                    int(np.ceil(len(self.states[episode_index]) * self.episode_end_fraction)),
+                )
+                self.states[episode_index] = self.states[episode_index][:stop]
+                self.actions[episode_index] = self.actions[episode_index][:stop]
+                if self.is_lerobot_v3:
+                    self.dataset_row_indices[episode_index] = self.dataset_row_indices[
+                        episode_index
+                    ][:stop]
         for state, action in zip(self.states, self.actions):
             if len(state) != len(action):
                 raise ValueError("state/action length mismatch in real LeRobot dataset")
@@ -612,6 +695,14 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
         self.episode_lengths = np.asarray(lengths, dtype=np.int64)
         self.agent_state_dim = int(self.states[0].shape[-1])
         self.action_dim = int(self.actions[0].shape[-1])
+        self.action_drop_masks = [
+            (
+                long_wait_drop_mask(action, **self.wait_filter_kwargs)
+                if self.drop_waiting
+                else np.zeros(len(action), dtype=bool)
+            )
+            for action in self.actions
+        ]
 
         self._video_cache: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
         n_ep = len(self.states)
@@ -623,12 +714,31 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
             self.horizon,
             self.pad_before,
             self.pad_after,
+            self.temporal_stride,
         )
+        self.sample_indices = self._filter_waiting_sample_indices(self.sample_indices)
+        dropped_actions = int(sum(mask.sum() for mask in self.action_drop_masks))
         print(
             f"[ThreadingRealLeRobotDataset] streaming {n_ep} real episodes: "
             f"{int(self.train_mask.sum())} train / {int(self.val_mask.sum())} val, "
-            f"{len(self.sample_indices)} train sequences"
+            f"{len(self.sample_indices)} train sequences, "
+            f"temporal_stride={self.temporal_stride}, "
+            f"episode_end_fraction={self.episode_end_fraction:g}, "
+            f"dropped_wait_actions={dropped_actions}"
         )
+
+    def _filter_waiting_sample_indices(self, indices: np.ndarray) -> np.ndarray:
+        if not self.drop_waiting:
+            return indices
+        keep = np.ones(len(indices), dtype=bool)
+        target_offset = (self.n_obs_steps - 1) * self.temporal_stride
+        for index, (episode, start) in enumerate(indices):
+            episode = int(episode)
+            target_row = int(np.clip(
+                int(start) + target_offset, 0, self.episode_lengths[episode] - 1
+            ))
+            keep[index] = not self.action_drop_masks[episode][target_row]
+        return indices[keep]
 
     def _read_parquet_episodes(self, max_frames_per_ep: int | None) -> None:
         try:
@@ -809,7 +919,9 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
             self.horizon,
             self.pad_before,
             self.pad_after,
+            self.temporal_stride,
         )
+        val_indices = self._filter_waiting_sample_indices(val_indices)
         if (
             self.max_validation_sequences is not None
             and len(val_indices) > self.max_validation_sequences
@@ -829,7 +941,10 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
 
     def get_normalizer(self, mode: str = "limits", **kwargs) -> LinearNormalizer:
         actions = np.concatenate(
-            [self.actions[index] for index in np.flatnonzero(self.train_mask)],
+            [
+                self.actions[index][~self.action_drop_masks[index]]
+                for index in np.flatnonzero(self.train_mask)
+            ],
             axis=0,
         )
         states = np.concatenate(
@@ -856,9 +971,12 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
         episode_index, sequence_start = self.sample_indices[idx]
         episode_index = int(episode_index)
         length = int(self.episode_lengths[episode_index])
-        raw_sequence_rows = int(sequence_start) + np.arange(self.horizon)
+        raw_sequence_rows = int(sequence_start) + (
+            np.arange(self.horizon) * self.temporal_stride
+        )
         action_is_pad = (raw_sequence_rows < 0) | (raw_sequence_rows >= length)
         sequence_rows = np.clip(raw_sequence_rows, 0, length - 1).astype(np.int64)
+        action_is_pad |= self.action_drop_masks[episode_index][sequence_rows]
         obs_rows = sequence_rows[: min(self.n_obs_steps, self.horizon)]
 
         if self.is_lerobot_v3:
