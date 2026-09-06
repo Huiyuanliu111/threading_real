@@ -40,6 +40,7 @@ PANDA_UPPER = np.array(
 )
 DEFAULT_SIDEVIEW_SERIAL = "233722072293"
 DEFAULT_WRIST_SERIAL = "233622071984"
+DEFAULT_FRONTVIEW_SERIAL = "233522077069"
 # Default evaluation start captured from the follower on 2026-09-04.
 # Pass --training-start-q explicitly to use a different safe start posture.
 TRAINING_START_Q = np.array(
@@ -161,24 +162,28 @@ def choose_gripper_transition(
 class ObservationFrame:
     sideview: torch.Tensor
     wrist: torch.Tensor
+    frontview: torch.Tensor
     agent_pos: torch.Tensor
     timestamp: float
+    tcp_pos: torch.Tensor | None = None
 
 
-class RealSensePair:
-    """Two serial-pinned RealSense color streams matching data collection."""
+class RealSenseRig:
+    """Three serial-pinned RealSense color streams matching data collection."""
 
     def __init__(
         self,
         sideview_serial: str,
         wrist_serial: str,
+        frontview_serial: str,
         *,
         width: int = 640,
         height: int = 480,
         fps: int = 30,
     ):
-        if sideview_serial == wrist_serial:
-            raise ValueError("sideview and wrist cameras must use different serial numbers")
+        serials = (sideview_serial, wrist_serial, frontview_serial)
+        if len(set(serials)) != len(serials):
+            raise ValueError("sideview, wrist, and frontview cameras must use distinct serial numbers")
         try:
             import pyrealsense2 as rs
         except ImportError as exc:
@@ -190,7 +195,7 @@ class RealSensePair:
         self.rs = rs
         self.pipelines: list[Any] = []
         try:
-            for serial in (sideview_serial, wrist_serial):
+            for serial in serials:
                 pipeline = rs.pipeline()
                 config = rs.config()
                 config.enable_device(serial)
@@ -204,7 +209,7 @@ class RealSensePair:
             self.close()
             raise
 
-    def read(self, timeout_ms: int = 1000) -> tuple[np.ndarray, np.ndarray]:
+    def read(self, timeout_ms: int = 1000) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         frames = []
         for pipeline in self.pipelines:
             frameset = pipeline.wait_for_frames(timeout_ms)
@@ -212,7 +217,7 @@ class RealSensePair:
             if not color:
                 raise RuntimeError("RealSense frameset has no color frame")
             frames.append(np.asanyarray(color.get_data()).copy())
-        return frames[0], frames[1]
+        return frames[0], frames[1], frames[2]
 
     def close(self) -> None:
         for pipeline in self.pipelines:
@@ -262,10 +267,12 @@ class GripperController:
 def make_observation(
     sideview_rgb: np.ndarray,
     wrist_rgb: np.ndarray,
+    frontview_rgb: np.ndarray,
     q: Sequence[float],
     gripper_width: float,
     image_size: int,
     pre_resize_image_size: int | None = None,
+    tcp_position: Sequence[float] | None = None,
 ) -> ObservationFrame:
     state = np.concatenate(
         [np.asarray(q, dtype=np.float32), np.asarray([gripper_width], dtype=np.float32)]
@@ -286,11 +293,24 @@ def make_observation(
             (pre_resize_image_size, pre_resize_image_size),
             interpolation=cv2.INTER_AREA,
         )
+        frontview_rgb = cv2.resize(
+            frontview_rgb,
+            (pre_resize_image_size, pre_resize_image_size),
+            interpolation=cv2.INTER_AREA,
+        )
+    tcp_tensor = None
+    if tcp_position is not None:
+        tcp = np.asarray(tcp_position, dtype=np.float32)
+        if tcp.shape != (3,) or not np.all(np.isfinite(tcp)):
+            raise ValueError(f"invalid TCP position: {tcp}")
+        tcp_tensor = torch.from_numpy(tcp)
     return ObservationFrame(
         sideview=image_to_policy_tensor(sideview_rgb, image_size),
         wrist=image_to_policy_tensor(wrist_rgb, image_size),
+        frontview=image_to_policy_tensor(frontview_rgb, image_size),
         agent_pos=torch.from_numpy(state),
         timestamp=time.monotonic(),
+        tcp_pos=tcp_tensor,
     )
 
 
@@ -299,11 +319,18 @@ def stack_observations(
 ) -> dict[str, torch.Tensor]:
     if not history:
         raise ValueError("observation history is empty")
-    return {
+    result = {
         "sideview": torch.stack([frame.sideview for frame in history]).unsqueeze(0).to(device),
         "wrist": torch.stack([frame.wrist for frame in history]).unsqueeze(0).to(device),
+        "frontview": torch.stack([frame.frontview for frame in history]).unsqueeze(0).to(device),
         "agent_pos": torch.stack([frame.agent_pos for frame in history]).unsqueeze(0).to(device),
     }
+    tcp_values = [frame.tcp_pos for frame in history]
+    if any(value is not None for value in tcp_values):
+        if not all(value is not None for value in tcp_values):
+            raise ValueError("TCP position must be present in every history frame or none")
+        result["tcp_pos"] = torch.stack(tcp_values).unsqueeze(0).to(device)
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -325,6 +352,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-cycles", type=int, default=0, help="0 runs until interrupted")
     parser.add_argument("--sideview-serial", default=DEFAULT_SIDEVIEW_SERIAL)
     parser.add_argument("--wrist-serial", default=DEFAULT_WRIST_SERIAL)
+    parser.add_argument("--frontview-serial", default=DEFAULT_FRONTVIEW_SERIAL)
     parser.add_argument("--image-size", type=int, default=96)
     parser.add_argument("--camera-timeout-ms", type=int, default=1000)
     parser.add_argument("--state-timeout", type=float, default=2.0)
@@ -444,6 +472,8 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("checkpoint must expect 8D [q1..q7, gripper_width] state")
     if int(getattr(policy, "action_dim", -1)) != 8:
         raise ValueError("checkpoint must predict 8D [q1..q7, gripper_width] actions")
+    if tuple(getattr(policy, "rgb_keys", ())) != ("sideview", "wrist", "frontview"):
+        raise ValueError("checkpoint must expect sideview, wrist, and frontview RGB inputs")
     n_obs_steps = int(policy.n_obs_steps)
     if args.execute_steps > int(policy.horizon):
         raise ValueError("--execute-steps cannot exceed the checkpoint horizon")
@@ -463,7 +493,7 @@ def run(args: argparse.Namespace) -> int:
         horizon_prev=n_obs_steps,
         sensor_size=29,
     )
-    cameras: RealSensePair | None = None
+    cameras: RealSenseRig | None = None
     streamer: Any | None = None
     stop_requested = False
 
@@ -513,20 +543,24 @@ def run(args: argparse.Namespace) -> int:
                     f"opening gripper ended in state {final_gripper_state}"
                 )
             state = client.wait_for_first_udp(timeout=args.state_timeout)
-        cameras = RealSensePair(args.sideview_serial, args.wrist_serial, fps=30)
+        cameras = RealSenseRig(
+            args.sideview_serial, args.wrist_serial, args.frontview_serial, fps=30
+        )
         current_width = client.get_gripper_width()
         gripper = GripperController(client, args, current_width)
         history: deque[ObservationFrame] = deque(maxlen=n_obs_steps)
 
         warmup_period = 1.0 / args.policy_hz
         for _ in range(n_obs_steps):
-            sideview, wrist = cameras.read(timeout_ms=args.camera_timeout_ms)
+            sideview, wrist, frontview = cameras.read(timeout_ms=args.camera_timeout_ms)
             state, info = client.get_latest_state(allow_stale=False)
             if state is None:
                 raise RuntimeError(f"robot state unavailable during warmup: {info}")
             current_width = client.get_gripper_width()
             history.append(
-                make_observation(sideview, wrist, state["q"], current_width, args.image_size)
+                make_observation(
+                    sideview, wrist, frontview, state["q"], current_width, args.image_size
+                )
             )
             time.sleep(warmup_period)
 
@@ -555,7 +589,7 @@ def run(args: argparse.Namespace) -> int:
         replan_period = args.execute_steps / args.policy_hz
         next_cycle = time.monotonic()
         while not stop_requested and (args.max_cycles == 0 or cycle < args.max_cycles):
-            sideview, wrist = cameras.read(timeout_ms=args.camera_timeout_ms)
+            sideview, wrist, frontview = cameras.read(timeout_ms=args.camera_timeout_ms)
             state, info = client.get_latest_state(allow_stale=False)
             if state is None:
                 raise RuntimeError(f"fresh robot state unavailable: {info}")
@@ -563,7 +597,9 @@ def run(args: argparse.Namespace) -> int:
                 raise RuntimeError("remote controller reports arm ERROR")
             current_width = client.get_gripper_width()
             history.append(
-                make_observation(sideview, wrist, state["q"], current_width, args.image_size)
+                make_observation(
+                    sideview, wrist, frontview, state["q"], current_width, args.image_size
+                )
             )
             obs = stack_observations(history, args.device)
             with torch.inference_mode():

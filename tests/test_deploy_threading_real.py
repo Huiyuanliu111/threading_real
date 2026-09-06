@@ -97,18 +97,21 @@ def test_stack_observations_has_policy_shapes() -> None:
     frame = runner.ObservationFrame(
         sideview=torch.zeros(3, 96, 96),
         wrist=torch.ones(3, 96, 96),
+        frontview=torch.full((3, 96, 96), 2.0),
         agent_pos=torch.arange(8, dtype=torch.float32),
         timestamp=0.0,
     )
     obs = runner.stack_observations([frame, frame], "cpu")
     assert obs["sideview"].shape == (1, 2, 3, 96, 96)
     assert obs["wrist"].shape == (1, 2, 3, 96, 96)
+    assert obs["frontview"].shape == (1, 2, 3, 96, 96)
     assert obs["agent_pos"].shape == (1, 2, 8)
 
 
 def test_make_observation_supports_training_resolution_replay() -> None:
     image = np.zeros((480, 640, 3), dtype=np.uint8)
     frame = runner.make_observation(
+        image,
         image,
         image,
         np.zeros(7),
@@ -118,3 +121,4 @@ def test_make_observation_supports_training_resolution_replay() -> None:
     )
     assert frame.sideview.shape == (3, 224, 224)
     assert frame.wrist.shape == (3, 224, 224)
+    assert frame.frontview.shape == (3, 224, 224)

@@ -119,6 +119,7 @@ def test_temporal_stride_sample_indices() -> None:
     )
     assert indices[0].tolist() == [0, -5]
     assert indices[-1].tolist() == [0, 10]
+    assert indices[:, 1].tolist() == [-5, 0, 5, 10]
 
 
 def test_long_wait_filter_only_drops_sustained_run_interior() -> None:

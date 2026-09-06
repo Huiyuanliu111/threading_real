@@ -15,7 +15,8 @@ task:
     camera_keys:
       - observation.images.exterior_image_2_right
       - observation.images.wrist_image_left
-    camera_output_keys: [sideview, wrist]
+      - observation.images.exterior_image_1_left
+    camera_output_keys: [sideview, wrist, frontview]
     image_size: 96
     n_obs_steps: ${policy.n_obs_steps}
     state_key: observation.state
@@ -29,6 +30,7 @@ task:
       agent_pos: {shape: [8], type: low_dim}
       sideview: {shape: [3, 96, 96], type: rgb}
       wrist: {shape: [3, 96, 96], type: rgb}
+      frontview: {shape: [3, 96, 96], type: rgb}
 
 dataloader: {batch_size: 32, num_workers: 4, persistent_workers: true, pin_memory: true, prefetch_factor: 2, multiprocessing_context: spawn, shuffle: true}
 val_dataloader: {batch_size: 32, num_workers: 2, persistent_workers: true, pin_memory: true, prefetch_factor: 2, multiprocessing_context: spawn, shuffle: false}
@@ -94,6 +96,7 @@ policy:
   camera_obs_keys:
     - observation.images.exterior_image_2_right
     - observation.images.wrist_image_left
+    - observation.images.exterior_image_1_left
   obs_encoder_group_norm: true
   pretrained: true
   backbone: resnet18

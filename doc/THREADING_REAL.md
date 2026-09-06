@@ -3,6 +3,35 @@
 This pipeline trains the existing `threading_task.policy.ThreadingARPolicy` on
 real Franka recordings converted to official LeRobot Dataset v3.0 format.
 
+## Spatial ARP for minimal block approach
+
+The legacy 7D regression policy is retained only for comparison. For the
+small-data block approach experiment, use the vision-forced spatial policy. It
+predicts terminal TCP heatmaps in the fixed side/front cameras, triangulates a
+3D goal, and emits one bounded Cartesian translation before replanning. Wrist
+RGB participates in the visual transformer but is not used for triangulation.
+
+First generate `calibration/block_grasp_spatial.json` by following
+`calibration/README.md`. Then train from scratch:
+
+```bash
+conda run -n pushbox python pushbox/train.py \
+  --config-name=threading_real_spatial_arp_block_approach
+```
+
+Do not resume a regression-ARP checkpoint: the output representation and loss
+are intentionally incompatible. Validate spatial localization before hardware:
+
+```bash
+conda run -n pushbox python scripts/diagnose_threading_spatial.py \
+  outputs/<run>/checkpoints/<checkpoint>.ckpt
+```
+
+Require low held-out pixel/3D error and a non-trivial
+`fixed_state_image_swap_goal_spread`. A random/unconfident checkpoint emits a
+zero translation by design. The normal Cartesian deployment script supports
+the new checkpoint and prints its triangulated goal and heatmap confidence.
+
 The `vla_finetune` recorder creates raw trial folders first. Convert a session
 from the `teleoperation` repository root:
 
@@ -16,9 +45,9 @@ The converter uses the official `lerobot` writer and creates v3 `meta/`,
 `data/`, and `videos/` shards. The current raw recorder does not persist camera
 or robot timestamps, so conversion uses normalized episode progress for 30 FPS
 alignment and records this limitation in `meta/vla_conversion_report.json`.
-The default raw-camera mapping is `cam1.mp4` = side view and `cam2.mp4` =
-wrist; pass explicit `--camera` arguments to the converter if the recording
-machine uses the opposite numbering.
+The default raw-camera mapping is `cam1.mp4` = side view, `cam2.mp4` = wrist,
+and `cam3.mp4` = front view; pass explicit `--camera` arguments to the converter
+if the recording layout differs.
 
 Expected LeRobot features:
 
@@ -26,6 +55,7 @@ Expected LeRobot features:
 | --- | --- |
 | `sideview` | `observation.images.exterior_image_2_right` |
 | `wrist` | `observation.images.wrist_image_left` |
+| `frontview` | `observation.images.exterior_image_1_left` |
 | `agent_pos` | `observation.state` = `[q1..q7, gripper_width]` |
 | `action` | `action` = next `[q1..q7, gripper_width]` |
 
@@ -120,11 +150,12 @@ python scripts/deploy_threading_real.py \
 ```
 
 The runner uses the same RealSense serial mapping as data collection: camera
-`233722072293` is `sideview`/`cam1`, and camera `233622071984` is
-`wrist`/`cam2`. Override `--sideview-serial` and `--wrist-serial` if the
-hardware mapping changes. Keep the Franka user stop reachable. Any camera,
-fresh-state, inference, or controller error exits the loop and requests TrackJ
-to stop. Hardware inference defaults to deterministic GMM MAP output. Raw
+`233722072293` is `sideview`/`cam1`, camera `233622071984` is `wrist`/`cam2`,
+and camera `233522077069` is `frontview`/`cam3`. Override the corresponding
+`--*-serial` option if the hardware mapping changes. Keep the Franka user stop
+reachable. Any camera, fresh-state, inference, or controller error exits the
+loop and requests TrackJ to stop. Hardware inference defaults to deterministic
+GMM MAP output. Raw
 targets with a first-point or adjacent-point jump above `0.15 rad` abort the
 rollout before that chunk is sent; smaller targets are additionally rate
 limited by `--max-first-delta` and `--max-step-delta`.
@@ -145,6 +176,52 @@ and streams the resulting poses through TrackC (UDP port 9200 by default).
 The runner requires `pinocchio` in the policy environment. Run dry-run first;
 real execution additionally requires explicit `--workspace-min X Y Z` and
 `--workspace-max X Y Z` bounds.
+
+For the block-grasp-minimal checkpoint, connect the three RealSense cameras to
+the GPU/inference workstation (`10.157.175.211`); the controller remains on
+the follower (`10.157.175.22`). Verify the serial mapping on the inference
+workstation with `rs-enumerate-devices -s`.
+
+On the follower, start the controller server manually:
+
+```bash
+ssh truphysics
+cd /home/truphysics/teleoperation/remote_controller
+./run_server.sh
+```
+
+Then, on the GPU workstation, run an inference-only dry-run. It captures state
+and cameras but does not start TrackC or send gripper commands:
+
+```bash
+cd /home/huiyuan/teleoperation/threading_real
+source /home/huiyuan/miniconda3/etc/profile.d/conda.sh
+conda activate pushbox
+python scripts/deploy_threading_real_cartesian.py \
+  outputs/block_grasp_minimal_three_view/checkpoints/epoch=0075-val_loss=0.077.ckpt \
+  --server-url http://10.157.175.22:8008/RPC2 \
+  --server-ip 10.157.175.22 --udp-ip 10.157.175.211 \
+  --policy-hz 6 --execute-steps 1 --max-cycles 20
+```
+
+After checking the printed deltas and clearing the workspace, begin with one
+synchronous real cycle. The bounds below cover the demonstration TCP workspace
+with a 3 cm margin:
+
+```bash
+python scripts/deploy_threading_real_cartesian.py \
+  outputs/block_grasp_minimal_three_view/checkpoints/epoch=0075-val_loss=0.077.ckpt \
+  --server-url http://10.157.175.22:8008/RPC2 \
+  --server-ip 10.157.175.22 --udp-ip 10.157.175.211 \
+  --policy-hz 6 --execute-steps 1 --synchronous --max-cycles 1 \
+  --workspace-min 0.301 -0.047 -0.115 \
+  --workspace-max 0.500 0.114 0.082 \
+  --move-to-training-start --execute --confirm-real-robot
+```
+
+The dataset was collected at 6 Hz, so keep `--policy-hz 6`: TrackC interpolates
+each 1/6-second policy delta internally at 500 Hz. Only one small policy delta
+is executed per cycle.
 
 Add `--synchronous` for strict observe-infer-act synchronization. In this mode,
 the runner sends one predicted action chunk, waits until TrackC has sent every

@@ -12,6 +12,7 @@ import numpy as np
 DEFAULT_REAL_CAMERA_KEYS = (
     "observation.images.exterior_image_2_right",
     "observation.images.wrist_image_left",
+    "observation.images.exterior_image_1_left",
 )
 
 

@@ -20,13 +20,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "remote_controller" / "src"))
 
 from scripts.deploy_threading_real import (  # noqa: E402
+    DEFAULT_FRONTVIEW_SERIAL,
     DEFAULT_SIDEVIEW_SERIAL,
     DEFAULT_WRIST_SERIAL,
     PANDA_LOWER,
     PANDA_UPPER,
     TRAINING_START_Q,
     GripperController,
-    RealSensePair,
+    RealSenseRig,
     diagonal_stiffness,
     make_observation,
     stack_observations,
@@ -180,8 +181,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--command-port", type=int, default=9200)
     parser.add_argument("--udp-frequency", type=int, default=500)
     parser.add_argument("--stream-hz", type=int, default=500)
-    parser.add_argument("--policy-hz", type=float, default=30.0)
-    parser.add_argument("--execute-steps", type=int, default=20)
+    parser.add_argument(
+        "--policy-hz",
+        type=float,
+        default=6.0,
+        help="policy/control rate; stride-5 block-grasp checkpoints are trained at 6 Hz",
+    )
+    parser.add_argument(
+        "--execute-steps",
+        type=int,
+        default=1,
+        help="number of predicted deltas executed before replanning; start real tests with 1",
+    )
     parser.add_argument("--max-cycles", type=int, default=0)
     parser.add_argument(
         "--synchronous",
@@ -195,6 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sync-poll-hz", type=float, default=50.0)
     parser.add_argument("--sideview-serial", default=DEFAULT_SIDEVIEW_SERIAL)
     parser.add_argument("--wrist-serial", default=DEFAULT_WRIST_SERIAL)
+    parser.add_argument("--frontview-serial", default=DEFAULT_FRONTVIEW_SERIAL)
     parser.add_argument(
         "--image-size",
         type=int,
@@ -277,6 +289,8 @@ def run(args: argparse.Namespace) -> int:
     policy = load_policy(str(args.checkpoint.expanduser()), device=args.device, weights=args.weights, use_checkpoint_config=True)
     if getattr(policy, "action_mode", None) != "cartesian_delta" or int(policy.action_dim) != 7:
         raise ValueError("checkpoint must be a 7D cartesian_delta policy")
+    if tuple(getattr(policy, "rgb_keys", ())) != ("sideview", "wrist", "frontview"):
+        raise ValueError("checkpoint must expect sideview, wrist, and frontview RGB inputs")
     if args.image_size is None:
         args.image_size = int(policy.image_shape[-1])
     if args.image_size <= 0:
@@ -316,13 +330,15 @@ def run(args: argparse.Namespace) -> int:
             client.gripper_release(args.gripper_speed, queue=True)
             state = client.wait_for_first_udp(timeout=args.state_timeout)
         robot_model = RobotModel()
-        cameras = RealSensePair(args.sideview_serial, args.wrist_serial, fps=30)
+        cameras = RealSenseRig(args.sideview_serial, args.wrist_serial, args.frontview_serial, fps=30)
         gripper = GripperController(client, args, client.get_gripper_width())
+        robot_model = RobotModel()
         history: deque[Any] = deque(maxlen=int(policy.n_obs_steps))
         for _ in range(int(policy.n_obs_steps)):
-            side, wrist = cameras.read(args.camera_timeout_ms); state, info = client.get_latest_state(allow_stale=False)
+            side, wrist, front = cameras.read(args.camera_timeout_ms); state, info = client.get_latest_state(allow_stale=False)
             if state is None: raise RuntimeError(f"robot state unavailable during warmup: {info}")
-            history.append(make_observation(side, wrist, state["q"], client.get_gripper_width(), args.image_size, args.pre_resize_image_size)); time.sleep(1 / args.policy_hz)
+            T_observation = client.get_tcp_pose_from_q(robot_model, state["q"], frame_name="panda_hand_tcp")
+            history.append(make_observation(side, wrist, front, state["q"], client.get_gripper_width(), args.image_size, args.pre_resize_image_size, tcp_position=T_observation[:3, 3])); time.sleep(1 / args.policy_hz)
         samples = max(1, round(args.stream_hz / args.policy_hz))
         T_start = client.get_tcp_pose_from_q(robot_model, state["q"], frame_name="panda_hand_tcp")
         if args.execute:
@@ -332,10 +348,12 @@ def run(args: argparse.Namespace) -> int:
         print(f"[runner] mode={'EXECUTE' if args.execute else 'DRY-RUN'} synchronous={args.synchronous} n_obs_steps={policy.n_obs_steps} execute_steps={args.execute_steps} samples_per_segment={samples}")
         cycle = 0; next_cycle = time.monotonic()
         while not stop and (args.max_cycles == 0 or cycle < args.max_cycles):
-            side, wrist = cameras.read(args.camera_timeout_ms); state, info = client.get_latest_state(allow_stale=False)
+            side, wrist, front = cameras.read(args.camera_timeout_ms); state, info = client.get_latest_state(allow_stale=False)
             if state is None: raise RuntimeError(f"fresh robot state unavailable: {info}")
             if state["arm_state"] == "ERROR": raise RuntimeError("remote controller reports arm ERROR")
-            width = client.get_gripper_width(); history.append(make_observation(side, wrist, state["q"], width, args.image_size, args.pre_resize_image_size))
+            width = client.get_gripper_width()
+            T_observation = client.get_tcp_pose_from_q(robot_model, state["q"], frame_name="panda_hand_tcp")
+            history.append(make_observation(side, wrist, front, state["q"], width, args.image_size, args.pre_resize_image_size, tcp_position=T_observation[:3, 3]))
             with torch.inference_mode(): raw = policy.predict_action(stack_observations(history, args.device))["action"][0].detach().cpu().numpy()
             if (
                 np.max(np.linalg.norm(raw[:, :3], axis=1)) > args.abort_translation
@@ -372,7 +390,18 @@ def run(args: argparse.Namespace) -> int:
                     f" sync_rot_err={np.degrees(sync_result['rotation_error']):.2f}deg"
                     f" sync_target={sync_result['within_tolerance']}"
                 )
-            print(f"[runner] cycle={cycle} state_age={info['age']:.4f}s raw_dxyz={stats['raw_first_translation']*1000:.2f}mm safe_dxyz={stats['safe_first_translation']*1000:.2f}mm raw_drot={np.degrees(stats['raw_first_rotation']):.2f}deg gripper={widths[-1]:.4f}m{sync_text}")
+            spatial_text = ""
+            diagnostics = getattr(policy, "last_spatial_diagnostics", None)
+            if diagnostics:
+                goal = diagnostics["goal_xyz"][0].detach().cpu().numpy()
+                confidence = diagnostics["confidence"][0].detach().cpu().numpy()
+                trustworthy = bool(diagnostics["trustworthy"][0].item())
+                spatial_text = (
+                    f" goal_xyz={np.round(goal, 4).tolist()}"
+                    f" heatmap_conf={np.round(confidence, 4).tolist()}"
+                    f" spatial_ok={trustworthy}"
+                )
+            print(f"[runner] cycle={cycle} state_age={info['age']:.4f}s raw_dxyz={stats['raw_first_translation']*1000:.2f}mm safe_dxyz={stats['safe_first_translation']*1000:.2f}mm raw_drot={np.degrees(stats['raw_first_rotation']):.2f}deg gripper={widths[-1]:.4f}m{spatial_text}{sync_text}")
             if args.synchronous:
                 continue
             next_cycle += period; remaining = next_cycle-time.monotonic()

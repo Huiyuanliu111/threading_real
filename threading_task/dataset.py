@@ -34,8 +34,9 @@ DEFAULT_CAMERA_KEYS = ("agentview_image", "robot0_eye_in_hand_image")
 DEFAULT_REAL_CAMERA_KEYS = (
     "observation.images.exterior_image_2_right",
     "observation.images.wrist_image_left",
+    "observation.images.exterior_image_1_left",
 )
-DEFAULT_REAL_CAMERA_OUTPUT_KEYS = ("sideview", "wrist")
+DEFAULT_REAL_CAMERA_OUTPUT_KEYS = ("sideview", "wrist", "frontview")
 
 
 def real_robot_action_representation(
@@ -181,7 +182,14 @@ def _build_sample_indices(
             - (horizon - 1) * temporal_stride
             + pad_after * temporal_stride
         )
-        rows.extend((episode_index, start) for start in range(min_start, max_start + 1))
+        # A strided trajectory should also advance sequence anchors at that
+        # cadence. Sampling every source frame here would create near-duplicate
+        # windows, overweight long episodes, and make video decoding roughly
+        # ``temporal_stride`` times more expensive than intended.
+        rows.extend(
+            (episode_index, start)
+            for start in range(min_start, max_start + 1, temporal_stride)
+        )
     if not rows:
         selected = lengths[episode_mask]
         raise ValueError(
@@ -1029,3 +1037,110 @@ class ThreadingRealLeRobotDataset(BaseImageDataset):
             "action_is_pad": action_is_pad,
         }
         return dict_apply(data, torch.from_numpy)
+
+
+class ThreadingSpatialLeRobotDataset(ThreadingRealLeRobotDataset):
+    """Real dataset with episode-goal TCP projections for spatial supervision.
+
+    Every frame in an episode is supervised toward one terminal TCP waypoint.
+    This turns the minimal approach task into visual goal localization instead
+    of next-delta regression. Fixed-camera projection matrices are estimated by
+    ``scripts/calibrate_threading_spatial.py``.
+    """
+
+    def __init__(
+        self,
+        *args,
+        calibration_path: str,
+        urdf_path: str,
+        spatial_camera_keys: tuple[str, ...] = ("sideview", "frontview"),
+        goal_backoff_frames: int = 0,
+        goal_tcp_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        from threading_task.kinematics import PandaForwardKinematics
+        from threading_task.spatial_geometry import (
+            load_projection_calibration,
+            project_points_numpy,
+        )
+
+        self.spatial_camera_keys = tuple(spatial_camera_keys)
+        if len(self.spatial_camera_keys) < 2:
+            raise ValueError("spatial reconstruction requires at least two fixed cameras")
+        missing = set(self.spatial_camera_keys) - set(self.camera_output_keys)
+        if missing:
+            raise ValueError(f"spatial cameras are not dataset outputs: {sorted(missing)}")
+        sizes = {
+            self.image_sizes[self.camera_output_keys.index(key)]
+            for key in self.spatial_camera_keys
+        }
+        if len(sizes) != 1:
+            raise ValueError("spatial cameras currently require one shared square image size")
+        spatial_size = sizes.pop()
+        self.spatial_projection_matrices = load_projection_calibration(
+            calibration_path,
+            self.spatial_camera_keys,
+            spatial_size,
+            spatial_size,
+        )
+        self.calibration_path = str(Path(calibration_path).expanduser().resolve())
+        self.urdf_path = str(Path(urdf_path).expanduser().resolve())
+        self.goal_backoff_frames = int(goal_backoff_frames)
+        if self.goal_backoff_frames < 0:
+            raise ValueError("goal_backoff_frames must be non-negative")
+        offset = np.asarray(goal_tcp_offset, dtype=np.float32)
+        if offset.shape != (3,) or not np.isfinite(offset).all():
+            raise ValueError("goal_tcp_offset must be a finite 3-vector")
+        self.goal_tcp_offset = offset
+
+        fk = PandaForwardKinematics(self.urdf_path)
+        self.tcp_positions = [
+            fk.positions(state[:, :7]).astype(np.float32)
+            for state in self.states
+        ]
+        self.goal_tcp_positions: list[np.ndarray] = []
+        self.goal_pixels: list[np.ndarray] = []
+        self.goal_visible: list[np.ndarray] = []
+        for positions in self.tcp_positions:
+            goal_index = max(0, len(positions) - 1 - self.goal_backoff_frames)
+            goal = positions[goal_index] + self.goal_tcp_offset
+            pixels, depth = project_points_numpy(
+                goal[None], self.spatial_projection_matrices
+            )
+            pixels = pixels[0]
+            visible = (
+                np.isfinite(pixels).all(axis=-1)
+                & (depth[0] > 0)
+                & (pixels[:, 0] >= 0)
+                & (pixels[:, 0] < spatial_size)
+                & (pixels[:, 1] >= 0)
+                & (pixels[:, 1] < spatial_size)
+            )
+            self.goal_tcp_positions.append(goal.astype(np.float32))
+            self.goal_pixels.append(pixels.astype(np.float32))
+            self.goal_visible.append(visible)
+
+        invalid = [
+            index for index, visible in enumerate(self.goal_visible) if int(visible.sum()) < 2
+        ]
+        if invalid:
+            raise ValueError(
+                "terminal TCP is not visible in at least two spatial cameras for "
+                f"episodes {invalid}; inspect calibration or goal_backoff_frames"
+            )
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        data = super().__getitem__(idx)
+        episode_index, sequence_start = self.sample_indices[idx]
+        episode_index = int(episode_index)
+        length = int(self.episode_lengths[episode_index])
+        raw_rows = int(sequence_start) + np.arange(self.horizon) * self.temporal_stride
+        rows = np.clip(raw_rows, 0, length - 1).astype(np.int64)
+        data["obs"]["tcp_pos"] = torch.from_numpy(
+            self.tcp_positions[episode_index][rows].astype(np.float32, copy=False)
+        )
+        data["spatial_goal_pixels"] = torch.from_numpy(self.goal_pixels[episode_index])
+        data["spatial_goal_valid"] = torch.from_numpy(self.goal_visible[episode_index])
+        data["spatial_goal_xyz"] = torch.from_numpy(self.goal_tcp_positions[episode_index])
+        return data
