@@ -1,0 +1,15 @@
+# Future-5-frame Cartesian deltas after a 5-frame Savitzky-Golay filter of the
+# reconstructed TCP translation path. Rotation/gripper labels remain unfiltered.
+defaults:
+  - threading_real_arp_cartesian_stride5
+  - _self_
+
+name: threading_real_arp_cartesian_stride5_smooth5
+
+task:
+  dataset:
+    dataset_path: /home/huiyuan/teleoperation/data/threading_lerobot_v3_cartesian_stride5_smooth5
+
+logging:
+  name: threading_real_arp_cartesian_stride5_smooth5
+  tags: [threading_real, lerobot, real_robot, arp, cartesian_delta, stride5, savgol5, frozen_visual]
