@@ -1,0 +1,35 @@
+# STOPPED 2026-09-06: retained only as the regression-ARP baseline. Do not use
+# this config for the next robot run; use threading_real_spatial_arp_block_approach.
+# Three-view, small-data recipe for the complete block pick-up trajectory.
+# Actions are cumulative t -> t+5 Cartesian deltas, so deploy at 6 Hz with
+# execute_steps=1. Unlike the approach-only parent, all episode frames are
+# eligible and long stationary runs are filtered by the inherited settings.
+defaults:
+  - threading_real_arp_cartesian_approach_stage1
+  - _self_
+
+name: threading_real_arp_cartesian_block_grasp_minimal
+
+task:
+  dataset:
+    dataset_path: /home/huiyuan/teleoperation/data/block_grasp_minimal_lerobot_v3_cartesian_stride5_224
+    episode_end_fraction: 1.0
+  name: threading_real_cartesian_block_grasp_minimal
+
+dataloader:
+  batch_size: 8
+
+val_dataloader:
+  batch_size: 8
+
+training:
+  gradient_accumulate_every: 8
+  num_epochs: 80
+  stop_at_epoch: 80
+  val_every: 5
+  checkpoint_every: 5
+
+logging:
+  mode: offline
+  name: threading_real_arp_cartesian_block_grasp_minimal
+  tags: [threading_real, block_grasp_minimal, three_view, cartesian_delta, stride5, resnet34]
