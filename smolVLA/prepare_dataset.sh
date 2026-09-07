@@ -38,7 +38,7 @@ python convert_vla_to_lerobot_v3.py \
   "${RAW_ROOT}" \
   "${JOINT_30HZ}" \
   --repo-id="${REPO_ID}_joint_30hz" \
-  --task="pick up the block" \
+  --task="insert the grasped block through the needle" \
   --fps=30 \
   --image-size=224 \
   --skip-depth
@@ -52,7 +52,7 @@ python threading_real/scripts/make_cartesian_stride_actions.py \
   "${STRIDE5_30HZ}" \
   --stride=5
 
-python threading_real/pi05/prepare_dataset.py \
+python threading_real/smolVLA/prepare_dataset.py \
   --source "${STRIDE5_30HZ}" \
   --output "${OUTPUT_ROOT}" \
   --repo-id "${REPO_ID}" \

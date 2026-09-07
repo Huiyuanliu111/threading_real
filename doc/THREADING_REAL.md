@@ -8,8 +8,7 @@ real Franka recordings converted to official LeRobot Dataset v3.0 format.
 The legacy 7D regression policy is retained only for comparison. For the
 small-data block approach experiment, use the vision-forced spatial policy. It
 predicts terminal TCP heatmaps in the fixed side/front cameras, triangulates a
-3D goal, and emits one bounded Cartesian translation before replanning. Wrist
-RGB participates in the visual transformer but is not used for triangulation.
+3D goal, and emits one bounded Cartesian translation before replanning.
 
 First generate `calibration/block_grasp_spatial.json` by following
 `calibration/README.md`. Then train from scratch:
@@ -45,16 +44,14 @@ The converter uses the official `lerobot` writer and creates v3 `meta/`,
 `data/`, and `videos/` shards. The current raw recorder does not persist camera
 or robot timestamps, so conversion uses normalized episode progress for 30 FPS
 alignment and records this limitation in `meta/vla_conversion_report.json`.
-The default raw-camera mapping is `cam1.mp4` = side view, `cam2.mp4` = wrist,
-and `cam3.mp4` = front view; pass explicit `--camera` arguments to the converter
-if the recording layout differs.
+The default raw-camera mapping is `cam1.mp4` = side view and `cam3.mp4` = front
+view. The wrist camera is not part of the current training dataset.
 
 Expected LeRobot features:
 
 | Model input | LeRobot feature |
 | --- | --- |
 | `sideview` | `observation.images.exterior_image_2_right` |
-| `wrist` | `observation.images.wrist_image_left` |
 | `frontview` | `observation.images.exterior_image_1_left` |
 | `agent_pos` | `observation.state` = `[q1..q7, gripper_width]` |
 | `action` | `action` = next `[q1..q7, gripper_width]` |

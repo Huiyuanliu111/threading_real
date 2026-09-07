@@ -13,10 +13,9 @@ conversion = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(conversion)
 
 
-def test_default_conversion_uses_three_cameras() -> None:
+def test_default_conversion_uses_two_fixed_cameras() -> None:
     assert conversion.DEFAULT_CAMERAS == (
         ("cam1.mp4", "observation.images.exterior_image_2_right"),
-        ("cam2.mp4", "observation.images.wrist_image_left"),
         ("cam3.mp4", "observation.images.exterior_image_1_left"),
     )
 

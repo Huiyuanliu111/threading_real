@@ -18,7 +18,6 @@ task:
     obs:
       agent_pos: {shape: [8], type: low_dim}
       sideview: {shape: [3, 224, 224], type: rgb}
-      wrist: {shape: [3, 224, 224], type: rgb}
       frontview: {shape: [3, 224, 224], type: rgb}
 
 policy:

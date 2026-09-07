@@ -15,7 +15,7 @@ NUM_WORKERS=${NUM_WORKERS:-2}
 STEPS=${STEPS:-10000}
 SAVE_FREQ=${SAVE_FREQ:-1000}
 MIN_FREE_MIB=${MIN_FREE_MIB:-12000}
-RENAME_MAP=${RENAME_MAP:-'{"observation.images.exterior_image_1_left":"observation.images.camera1","observation.images.exterior_image_2_right":"observation.images.camera2","observation.images.wrist_image_left":"observation.images.camera3"}'}
+RENAME_MAP=${RENAME_MAP:-'{"observation.images.exterior_image_1_left":"observation.images.camera1","observation.images.exterior_image_2_right":"observation.images.camera2"}'}
 
 if [[ ! "${GPU_ID}" =~ ^[0-9]+$ ]]; then
   echo "GPU_ID must be one physical GPU index; got ${GPU_ID}." >&2

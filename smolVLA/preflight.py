@@ -13,7 +13,6 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 CAMERAS = {
     "observation.images.exterior_image_1_left",
     "observation.images.exterior_image_2_right",
-    "observation.images.wrist_image_left",
 }
 ACTION_NAMES = ["dx", "dy", "dz", "drotvec_x", "drotvec_y", "drotvec_z", "dgripper"]
 

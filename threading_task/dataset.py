@@ -33,10 +33,9 @@ ACTION_DIM = 7
 DEFAULT_CAMERA_KEYS = ("agentview_image", "robot0_eye_in_hand_image")
 DEFAULT_REAL_CAMERA_KEYS = (
     "observation.images.exterior_image_2_right",
-    "observation.images.wrist_image_left",
     "observation.images.exterior_image_1_left",
 )
-DEFAULT_REAL_CAMERA_OUTPUT_KEYS = ("sideview", "wrist", "frontview")
+DEFAULT_REAL_CAMERA_OUTPUT_KEYS = ("sideview", "frontview")
 
 
 def real_robot_action_representation(

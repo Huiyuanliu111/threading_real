@@ -1,4 +1,4 @@
-# SmolVLA 轻量微调：最小积木抓取
+# SmolVLA 轻量微调：穿针
 
 这套脚本在单张 16 GB RTX 4060 Ti 上微调 `lerobot/smolvla_base`。默认冻结视觉编码器
 和 VLM，只训练 action expert 与状态投影；这比 π0.5 全量微调节省大量显存和磁盘。
@@ -11,21 +11,20 @@
 
 - 原始数据：`data/block_grasp`，包含 20 条同步 RGB-D 示范。
 - 训练数据：从原始数据生成 `data/block_grasp_smolvla_6hz`。
-- 输入：三个 224×224 RGB 视角和 8 维状态。
+- 输入：两个 224×224 RGB 视角（侧视和前视）及 8 维状态。
 - 输出：7 维 Cartesian 增量。
 - 控制频率：6 Hz。
 - action chunk：10 步；每次执行 2 步后重规划。
-- 提示词：`pick up the block`。
+- 提示词：`insert the grasped block through the needle`。
 
 SmolVLA 会在模型内部将图像 resize/pad 到预训练分辨率。状态和动作会自动填充到模型的
 32 维上限，输出时再裁回 7 维。
 
-预训练模型使用 `camera1/2/3` 键名。训练脚本显式采用以下固定映射，并把映射保存在
+预训练模型使用通用相机键名。训练脚本显式采用以下固定映射，并把映射保存在
 checkpoint 的预处理器中：
 
 - `exterior_image_1_left` → `camera1`
 - `exterior_image_2_right` → `camera2`
-- `wrist_image_left` → `camera3`
 
 ## 1. 创建本机环境
 
@@ -43,7 +42,7 @@ SmolVLA 权重公开，不需要 PaliGemma gated model 许可。
 ## 2. 生成 RGB-only 训练数据
 
 原始数据不是 LeRobot 格式。下面的脚本先验证 RGB-D 时间同步和流完整性，但转换时显式
-使用 `--skip-depth`，最终模型只读取三路 RGB。转换链为：
+使用 `--skip-depth`，最终模型只读取侧视和前视两路 RGB。转换链为：
 
 1. 原始同步录制 → 30 Hz LeRobot v3 关节目标；
 2. 关节目标 → 单帧 7 维 Cartesian delta；

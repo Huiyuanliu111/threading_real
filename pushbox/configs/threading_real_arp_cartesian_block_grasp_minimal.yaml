@@ -1,6 +1,6 @@
 # STOPPED 2026-09-06: retained only as the regression-ARP baseline. Do not use
 # this config for the next robot run; use threading_real_spatial_arp_block_approach.
-# Three-view, small-data recipe for the complete block pick-up trajectory.
+# Two-view, small-data recipe for the complete block pick-up trajectory.
 # Actions are cumulative t -> t+5 Cartesian deltas, so deploy at 6 Hz with
 # execute_steps=1. Unlike the approach-only parent, all episode frames are
 # eligible and long stationary runs are filtered by the inherited settings.
@@ -32,4 +32,4 @@ training:
 logging:
   mode: offline
   name: threading_real_arp_cartesian_block_grasp_minimal
-  tags: [threading_real, block_grasp_minimal, three_view, cartesian_delta, stride5, resnet34]
+  tags: [threading_real, block_grasp_minimal, two_view, cartesian_delta, stride5, resnet34]
