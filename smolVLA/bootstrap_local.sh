@@ -32,6 +32,10 @@ PYTHON_BIN=$("${UV_BIN}" python find "${PYTHON_VERSION}")
   --index-url "${TORCH_INDEX}"
 "${ENV_DIR}/bin/python" -m pip install \
   "lerobot[smolvla,training] @ git+https://github.com/huggingface/lerobot.git@${LEROBOT_COMMIT}"
+"${ENV_DIR}/bin/python" -m pip install \
+  scipy==1.16.3 \
+  pin==4.1.0 \
+  pyrealsense2==2.58.4.10922
 
 "${ENV_DIR}/bin/python" - <<'PY'
 import torch

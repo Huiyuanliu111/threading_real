@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import json
 from pathlib import Path
 import signal
 import sys
@@ -17,6 +18,7 @@ from scipy.spatial.transform import Rotation
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PROJECT_ROOT.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "remote_controller" / "src"))
 
 from scripts.deploy_threading_real import (  # noqa: E402
@@ -32,7 +34,47 @@ from scripts.deploy_threading_real import (  # noqa: E402
     make_observation,
     stack_observations,
 )
-from scripts.eval_policy import load_policy  # noqa: E402
+def _live_rays(intrinsic: dict[str, float]) -> np.ndarray:
+    u, v = np.meshgrid(np.arange(int(intrinsic["width"])), np.arange(int(intrinsic["height"])))
+    return np.stack((
+        (u - intrinsic["ppx"]) / intrinsic["fx"],
+        (v - intrinsic["ppy"]) / intrinsic["fy"],
+        np.ones_like(u),
+    ), axis=-1).astype(np.float32)
+
+
+def make_live_pointcloud_observation(
+    rgbd_frames, cameras: RealSenseRig, calibration: dict[str, Any],
+    q: Sequence[float], gripper_width: float, tcp_position: np.ndarray,
+    num_points: int, bounds: np.ndarray, rng: np.random.Generator,
+) -> dict[str, torch.Tensor]:
+    from build_vla_pointcloud_dataset import crop_and_sample, depth_to_base_points
+    from threading_task.pointcloud_dataset import rasterize_bev
+
+    points, colors, camera_ids = [], [], []
+    for rig_index, calibration_key, source_id in ((0, "sideview", 0), (2, "frontview", 1)):
+        rgb, depth = rgbd_frames[rig_index]
+        xyz, valid = depth_to_base_points(
+            depth, _live_rays(cameras.color_intrinsics[rig_index]),
+            cameras.depth_scales[rig_index],
+            np.asarray(calibration["cameras"][calibration_key]["camera_from_base"]),
+        )
+        points.append(xyz)
+        colors.append(rgb[valid])
+        camera_ids.append(np.full(len(xyz), source_id, dtype=np.uint8))
+    xyz, rgb, source, _ = crop_and_sample(points, colors, camera_ids, bounds, num_points, rng)
+    bev = rasterize_bev(xyz, rgb.astype(np.float32) / 255, source, bounds, 64)
+    state = np.concatenate((np.asarray(q, np.float32), [gripper_width])).astype(np.float32)
+    return {
+        "points": torch.from_numpy(xyz), "colors": torch.from_numpy(rgb.astype(np.float32) / 255),
+        "camera_id": torch.from_numpy(source.astype(np.int64)),
+        "bev": torch.from_numpy(bev),
+        "agent_pos": torch.from_numpy(state), "tcp_pos": torch.from_numpy(np.asarray(tcp_position, np.float32)),
+    }
+
+
+def stack_pointcloud_observations(history, device: str) -> dict[str, torch.Tensor]:
+    return {key: torch.stack([frame[key] for frame in history]).unsqueeze(0).to(device) for key in history[0]}
 
 
 def cartesian_stiffness(values: Sequence[float]) -> list[list[float]]:
@@ -112,6 +154,89 @@ def cartesian_pose_error(current_T: np.ndarray, target_T: np.ndarray) -> tuple[f
     return translation, rotation
 
 
+class SmolVLADeploymentPolicy:
+    """Adapt a LeRobot SmolVLA checkpoint to the existing TrackC runner."""
+
+    action_mode = "cartesian_delta"
+    action_dim = 7
+    uses_pointcloud = False
+    rgb_keys = ("sideview", "wrist", "frontview")
+    image_shape = (3, 224, 224)
+    n_obs_steps = 1
+
+    def __init__(self, checkpoint: Path, device: str, task: str):
+        from lerobot.policies.factory import make_pre_post_processors
+        try:
+            from lerobot.policies.smolvla import SmolVLAPolicy
+        except ImportError:
+            try:
+                from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+            except ImportError as exc:
+                raise ImportError(
+                    "SmolVLA deployment requires the project .venv-smolvla environment; "
+                    "run `source /home/huiyuan/teleoperation/.venv-smolvla/bin/activate`"
+                ) from exc
+
+        self.device = device
+        self.task = task
+        self.model = SmolVLAPolicy.from_pretrained(checkpoint).to(device).eval()
+        self.preprocess, self.postprocess = make_pre_post_processors(
+            self.model.config,
+            str(checkpoint),
+            preprocessor_overrides={"device_processor": {"device": device}},
+        )
+        self.horizon = int(self.model.config.chunk_size)
+        self.n_action_steps = int(self.model.config.n_action_steps)
+        action_feature = self.model.config.output_features["action"]
+        if self.horizon != 10 or int(action_feature.shape[0]) != 7:
+            raise ValueError("SmolVLA checkpoint must emit a 10x7 action chunk")
+
+    def predict_action(self, observations: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        expected = {"sideview", "wrist", "frontview", "agent_pos"}
+        missing = expected.difference(observations)
+        if missing:
+            raise KeyError(f"missing live SmolVLA observations: {sorted(missing)}")
+        frame = {
+            # Feed the original dataset keys. The saved processor renames them
+            # to camera1/2/3 exactly as it did during training.
+            "observation.images.exterior_image_2_right": observations["sideview"][0, -1],
+            "observation.images.wrist_image_left": observations["wrist"][0, -1],
+            "observation.images.exterior_image_1_left": observations["frontview"][0, -1],
+            "observation.state": observations["agent_pos"][0, -1],
+            "task": self.task,
+        }
+        batch = self.preprocess(frame)
+        chunk = self.postprocess(self.model.predict_action_chunk(batch))
+        return {"action": chunk[:, : self.n_action_steps]}
+
+
+def load_deployment_policy(
+    checkpoint: Path,
+    *,
+    device: str,
+    weights: str,
+    policy_kind: str,
+    task: str,
+):
+    checkpoint = checkpoint.expanduser().resolve()
+    detected_kind = policy_kind
+    config_path = checkpoint / "config.json"
+    if detected_kind == "auto" and config_path.is_file():
+        config = json.loads(config_path.read_text())
+        detected_kind = "smolvla" if config.get("type") == "smolvla" else "pushbox"
+    elif detected_kind == "auto":
+        detected_kind = "pushbox"
+    if detected_kind == "smolvla":
+        print(f"[runner] loading SmolVLA checkpoint: {checkpoint}")
+        return SmolVLADeploymentPolicy(checkpoint, device, task)
+
+    from scripts.eval_policy import load_policy
+
+    return load_policy(
+        str(checkpoint), device=device, weights=weights, use_checkpoint_config=True
+    )
+
+
 def wait_for_trackc_segment(
     streamer: Any,
     client: Any,
@@ -173,6 +298,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Deploy a Cartesian-delta ThreadingReal checkpoint via TrackC")
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--policy-kind", choices=("auto", "pushbox", "smolvla"), default="auto")
+    parser.add_argument("--task", default="pick up the block")
     parser.add_argument("--weights", choices=("ema", "model"), default="ema")
     parser.add_argument("--server-url", default="http://localhost:8008/RPC2")
     parser.add_argument("--server-ip", default="127.0.0.1")
@@ -207,6 +334,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sideview-serial", default=DEFAULT_SIDEVIEW_SERIAL)
     parser.add_argument("--wrist-serial", default=DEFAULT_WRIST_SERIAL)
     parser.add_argument("--frontview-serial", default=DEFAULT_FRONTVIEW_SERIAL)
+    parser.add_argument(
+        "--pointcloud-calibration",
+        type=Path,
+        default=PROJECT_ROOT / "calibration" / "block_grasp_spatial.json",
+    )
+    parser.add_argument("--pointcloud-num-points", type=int, default=4096)
     parser.add_argument(
         "--image-size",
         type=int,
@@ -286,14 +419,21 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("--allow-unbounded-workspace cannot be combined with workspace bounds")
     if args.execute and args.allow_unbounded_workspace:
         print("[runner] WARNING: executing without TCP workspace bounds")
-    policy = load_policy(str(args.checkpoint.expanduser()), device=args.device, weights=args.weights, use_checkpoint_config=True)
+    policy = load_deployment_policy(
+        args.checkpoint,
+        device=args.device,
+        weights=args.weights,
+        policy_kind=args.policy_kind,
+        task=args.task,
+    )
     if getattr(policy, "action_mode", None) != "cartesian_delta" or int(policy.action_dim) != 7:
         raise ValueError("checkpoint must be a 7D cartesian_delta policy")
-    if tuple(getattr(policy, "rgb_keys", ())) != ("sideview", "wrist", "frontview"):
+    pointcloud_mode = bool(getattr(policy, "uses_pointcloud", False))
+    if not pointcloud_mode and tuple(getattr(policy, "rgb_keys", ())) != ("sideview", "wrist", "frontview"):
         raise ValueError("checkpoint must expect sideview, wrist, and frontview RGB inputs")
-    if args.image_size is None:
+    if not pointcloud_mode and args.image_size is None:
         args.image_size = int(policy.image_shape[-1])
-    if args.image_size <= 0:
+    if not pointcloud_mode and args.image_size <= 0:
         raise ValueError("--image-size must be positive")
     if args.pre_resize_image_size is not None and args.pre_resize_image_size <= 0:
         raise ValueError("--pre-resize-image-size must be positive")
@@ -305,11 +445,30 @@ def run(args: argparse.Namespace) -> int:
     policy.n_action_steps = args.execute_steps
     if hasattr(policy, "set_prediction_mode"):
         policy.set_prediction_mode("full_then_truncate")
-    if args.gmm_eval_mode == "map":
+    if isinstance(policy, SmolVLADeploymentPolicy):
+        if args.gmm_eval_mode != "map":
+            raise ValueError("--gmm-eval-mode only applies to PushBox policies")
+    elif args.gmm_eval_mode == "map":
         from threading_task.policy import enable_map_gmm_inference
         enable_map_gmm_inference(policy)
     else:
         policy.use_sample = args.gmm_eval_mode == "sample"
+    calibration = None
+    pointcloud_rng = np.random.default_rng(42)
+    pointcloud_bounds = None
+    if pointcloud_mode:
+        if args.pointcloud_num_points <= 0:
+            raise ValueError("--pointcloud-num-points must be positive")
+        calibration = json.loads(args.pointcloud_calibration.expanduser().read_text())
+        expected = {
+            "sideview": args.sideview_serial,
+            "frontview": args.frontview_serial,
+        }
+        for key, serial in expected.items():
+            calibrated = str(calibration["cameras"][key].get("serial", ""))
+            if calibrated and calibrated != serial:
+                raise ValueError(f"{key} calibration serial {calibrated} != live serial {serial}")
+        pointcloud_bounds = policy.point_bounds.detach().cpu().numpy().reshape(-1)
     client = RemoteControllerClient(args.server_url, capacity=max(16, int(policy.n_obs_steps) + 2), horizon_prev=int(policy.n_obs_steps), sensor_size=29)
     cameras = streamer = None
     stop = False
@@ -330,15 +489,27 @@ def run(args: argparse.Namespace) -> int:
             client.gripper_release(args.gripper_speed, queue=True)
             state = client.wait_for_first_udp(timeout=args.state_timeout)
         robot_model = RobotModel()
-        cameras = RealSenseRig(args.sideview_serial, args.wrist_serial, args.frontview_serial, fps=30)
+        cameras = RealSenseRig(
+            args.sideview_serial, args.wrist_serial, args.frontview_serial,
+            fps=30, enable_depth=pointcloud_mode,
+        )
         gripper = GripperController(client, args, client.get_gripper_width())
         robot_model = RobotModel()
         history: deque[Any] = deque(maxlen=int(policy.n_obs_steps))
         for _ in range(int(policy.n_obs_steps)):
-            side, wrist, front = cameras.read(args.camera_timeout_ms); state, info = client.get_latest_state(allow_stale=False)
+            camera_data = cameras.read_rgbd(args.camera_timeout_ms) if pointcloud_mode else cameras.read(args.camera_timeout_ms)
+            state, info = client.get_latest_state(allow_stale=False)
             if state is None: raise RuntimeError(f"robot state unavailable during warmup: {info}")
             T_observation = client.get_tcp_pose_from_q(robot_model, state["q"], frame_name="panda_hand_tcp")
-            history.append(make_observation(side, wrist, front, state["q"], client.get_gripper_width(), args.image_size, args.pre_resize_image_size, tcp_position=T_observation[:3, 3])); time.sleep(1 / args.policy_hz)
+            if pointcloud_mode:
+                history.append(make_live_pointcloud_observation(
+                    camera_data, cameras, calibration, state["q"], client.get_gripper_width(),
+                    T_observation[:3, 3], args.pointcloud_num_points, pointcloud_bounds, pointcloud_rng,
+                ))
+            else:
+                side, wrist, front = camera_data
+                history.append(make_observation(side, wrist, front, state["q"], client.get_gripper_width(), args.image_size, args.pre_resize_image_size, tcp_position=T_observation[:3, 3]))
+            time.sleep(1 / args.policy_hz)
         samples = max(1, round(args.stream_hz / args.policy_hz))
         T_start = client.get_tcp_pose_from_q(robot_model, state["q"], frame_name="panda_hand_tcp")
         if args.execute:
@@ -348,13 +519,23 @@ def run(args: argparse.Namespace) -> int:
         print(f"[runner] mode={'EXECUTE' if args.execute else 'DRY-RUN'} synchronous={args.synchronous} n_obs_steps={policy.n_obs_steps} execute_steps={args.execute_steps} samples_per_segment={samples}")
         cycle = 0; next_cycle = time.monotonic()
         while not stop and (args.max_cycles == 0 or cycle < args.max_cycles):
-            side, wrist, front = cameras.read(args.camera_timeout_ms); state, info = client.get_latest_state(allow_stale=False)
+            camera_data = cameras.read_rgbd(args.camera_timeout_ms) if pointcloud_mode else cameras.read(args.camera_timeout_ms)
+            state, info = client.get_latest_state(allow_stale=False)
             if state is None: raise RuntimeError(f"fresh robot state unavailable: {info}")
             if state["arm_state"] == "ERROR": raise RuntimeError("remote controller reports arm ERROR")
             width = client.get_gripper_width()
             T_observation = client.get_tcp_pose_from_q(robot_model, state["q"], frame_name="panda_hand_tcp")
-            history.append(make_observation(side, wrist, front, state["q"], width, args.image_size, args.pre_resize_image_size, tcp_position=T_observation[:3, 3]))
-            with torch.inference_mode(): raw = policy.predict_action(stack_observations(history, args.device))["action"][0].detach().cpu().numpy()
+            if pointcloud_mode:
+                history.append(make_live_pointcloud_observation(
+                    camera_data, cameras, calibration, state["q"], width, T_observation[:3, 3],
+                    args.pointcloud_num_points, pointcloud_bounds, pointcloud_rng,
+                ))
+                policy_obs = stack_pointcloud_observations(history, args.device)
+            else:
+                side, wrist, front = camera_data
+                history.append(make_observation(side, wrist, front, state["q"], width, args.image_size, args.pre_resize_image_size, tcp_position=T_observation[:3, 3]))
+                policy_obs = stack_observations(history, args.device)
+            with torch.inference_mode(): raw = policy.predict_action(policy_obs)["action"][0].detach().cpu().numpy()
             if (
                 np.max(np.linalg.norm(raw[:, :3], axis=1)) > args.abort_translation
                 or np.max(np.linalg.norm(raw[:, 3:6], axis=1)) > args.abort_rotation

@@ -21,7 +21,7 @@ ACTION_NAMES = ["dx", "dy", "dz", "drotvec_x", "drotvec_y", "drotvec_z", "dgripp
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--repo-id", default="threading_real/block_grasp_minimal_pi05_6hz")
+    parser.add_argument("--repo-id", default="threading_real/block_grasp_smolvla_6hz")
     parser.add_argument("--chunk-size", type=int, default=10)
     args = parser.parse_args()
 

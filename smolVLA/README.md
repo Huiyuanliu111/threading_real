@@ -9,7 +9,8 @@
 
 ## 数据与控制定义
 
-- 复用 `data/block_grasp_minimal_pi05_6hz`，无需重新转换。
+- 原始数据：`data/block_grasp`，包含 20 条同步 RGB-D 示范。
+- 训练数据：从原始数据生成 `data/block_grasp_smolvla_6hz`。
 - 输入：三个 224×224 RGB 视角和 8 维状态。
 - 输出：7 维 Cartesian 增量。
 - 控制频率：6 Hz。
@@ -39,14 +40,30 @@ source .venv-smolvla/bin/activate
 如果环境已存在且确实要重建，手动删除 `/home/huiyuan/teleoperation/.venv-smolvla` 后再执行。
 SmolVLA 权重公开，不需要 PaliGemma gated model 许可。
 
-## 2. 数据预检
+## 2. 生成 RGB-only 训练数据
+
+原始数据不是 LeRobot 格式。下面的脚本先验证 RGB-D 时间同步和流完整性，但转换时显式
+使用 `--skip-depth`，最终模型只读取三路 RGB。转换链为：
+
+1. 原始同步录制 → 30 Hz LeRobot v3 关节目标；
+2. 关节目标 → 单帧 7 维 Cartesian delta；
+3. 累积为 `t → t+5` Cartesian delta；
+4. 图像和状态真正 stride-5 降采样到 6 Hz。
+
+```bash
+source .venv-smolvla/bin/activate
+bash threading_real/smolVLA/prepare_dataset.sh
+```
+
+脚本不会覆盖已有或半成品输出。转换成功后会自动运行预检，最终必须包含
+`"errors": []`。中间数据集会保留以便诊断；确认最终数据后可手动清理。
+
+若数据已经成功生成，可单独重新预检：
 
 ```bash
 python threading_real/smolVLA/preflight.py \
-  --dataset-root data/block_grasp_minimal_pi05_6hz
+  --dataset-root data/block_grasp_smolvla_6hz
 ```
-
-输出必须包含 `"errors": []`。
 
 ## 3. 两步显存测试
 
@@ -82,7 +99,7 @@ GPU_ID=0 BATCH_SIZE=1 STEPS=10000 SAVE_FREQ=1000 \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 lerobot-train \
-  --config_path=threading_real/smolVLA/outputs/block_grasp_minimal_expert/checkpoints/last/pretrained_model/train_config.json \
+  --config_path=threading_real/smolVLA/outputs/block_grasp_expert/checkpoints/last/pretrained_model/train_config.json \
   --resume=true
 ```
 
@@ -90,8 +107,8 @@ CUDA_VISIBLE_DEVICES=0 lerobot-train \
 
 ```bash
 python threading_real/smolVLA/infer_one.py \
-  --checkpoint threading_real/smolVLA/outputs/block_grasp_minimal_expert/checkpoints/last/pretrained_model \
-  --dataset-root data/block_grasp_minimal_pi05_6hz \
+  --checkpoint threading_real/smolVLA/outputs/block_grasp_expert/checkpoints/last/pretrained_model \
+  --dataset-root data/block_grasp_smolvla_6hz \
   --frame 0
 ```
 

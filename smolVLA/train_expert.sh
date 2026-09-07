@@ -5,9 +5,9 @@ set -euo pipefail
 # and train the action expert plus state projection.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
-DATASET_ROOT=${DATASET_ROOT:-${PROJECT_ROOT}/data/block_grasp_minimal_pi05_6hz}
-REPO_ID=${REPO_ID:-threading_real/block_grasp_minimal_pi05_6hz}
-OUTPUT_DIR=${OUTPUT_DIR:-${SCRIPT_DIR}/outputs/block_grasp_minimal_expert}
+DATASET_ROOT=${DATASET_ROOT:-${PROJECT_ROOT}/data/block_grasp_smolvla_6hz}
+REPO_ID=${REPO_ID:-threading_real/block_grasp_smolvla_6hz}
+OUTPUT_DIR=${OUTPUT_DIR:-${SCRIPT_DIR}/outputs/block_grasp_expert}
 MODEL_ID=${MODEL_ID:-lerobot/smolvla_base}
 GPU_ID=${GPU_ID:-0}
 BATCH_SIZE=${BATCH_SIZE:-1}
@@ -75,7 +75,7 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
   --accelerator.mixed_precision=bf16 \
   --checkpoint_format=safetensors \
   --output_dir="${OUTPUT_DIR}" \
-  --job_name=block_grasp_minimal_smolvla_expert \
+  --job_name=block_grasp_smolvla_expert \
   --batch_size="${BATCH_SIZE}" \
   --num_workers="${NUM_WORKERS}" \
   --steps="${STEPS}" \

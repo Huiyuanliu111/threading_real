@@ -1,0 +1,143 @@
+name: threading_real_pointcloud_spatial_arp_block_grasp
+_target_: pushbox.workspace.PushBoxARPWorkspace
+task:
+  dataset:
+    _target_: threading_task.pointcloud_dataset.ThreadingPointCloudSpatialDataset
+    dataset_path: /home/huiyuan/teleoperation/data/block_grasp_pointcloud_stride5.h5
+    urdf_path: /home/huiyuan/teleoperation/remote_controller/src/remote_controller/assets/panda/panda_arm.urdf
+    horizon: 1
+    n_obs_steps: 1
+    val_ratio: 0.2
+    seed: 42
+    episode_end_fraction: 0.65
+    goal_backoff_frames: 0
+    max_points: 4096
+  name: threading_real_pointcloud_spatial_block_grasp
+  shape_meta:
+    action:
+      shape:
+      - 7
+    obs:
+      points:
+        shape:
+        - 4096
+        - 3
+        type: low_dim
+      colors:
+        shape:
+        - 4096
+        - 3
+        type: low_dim
+      camera_id:
+        shape:
+        - 4096
+        type: low_dim
+      agent_pos:
+        shape:
+        - 8
+        type: low_dim
+      tcp_pos:
+        shape:
+        - 3
+        type: low_dim
+dataloader:
+  batch_size: 8
+  num_workers: 2
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+  multiprocessing_context: spawn
+  shuffle: true
+val_dataloader:
+  batch_size: 8
+  num_workers: 1
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+  multiprocessing_context: spawn
+  shuffle: false
+training:
+  device: cuda:0
+  seed: 42
+  debug: true
+  resume: false
+  resume_optimizer: true
+  resume_path: null
+  use_ema: true
+  lr_scheduler: cosine
+  lr_num_cycles: 1
+  lr_warmup_steps: 200
+  gradient_accumulate_every: 2
+  num_epochs: 160
+  stop_at_epoch: 160
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+  val_every: 5
+  sample_every: 1000
+  checkpoint_every: 5
+ema:
+  _target_: pushbox.diffusion_policy.model.diffusion.ema_model.EMAModel
+  inv_gamma: 1.0
+  max_value: 0.9999
+  min_value: 0.0
+  power: 0.75
+  update_after_step: 0
+optimizer:
+  lr: 0.0003
+  betas:
+  - 0.9
+  - 0.999
+  transformer_weight_decay: 0.0001
+policy:
+  _target_: threading_task.pointcloud_spatial_policy.ThreadingPointCloudSpatialARPolicy
+  point_bounds:
+  - 0.15
+  - -0.4
+  - -0.15
+  - 0.75
+  - 0.3
+  - 0.5
+  goal_bounds:
+  - 0.3
+  - -0.13
+  - -0.09
+  - 0.54
+  - 0.08
+  - -0.02
+  action_mode: cartesian_delta
+  horizon: 1
+  n_action_steps: 1
+  n_obs_steps: 1
+  bins: 96
+  hidden_dim: 192
+  dropout: 0.1
+  xyz_loss_weight: 20.0
+  point_jitter_std: 0.001
+  color_jitter_std: 0.02
+  point_dropout: 0.1
+  max_translation_step: 0.008
+  stop_distance: 0.003
+  max_goal_distance: 0.25
+  min_confidence: 0.08
+logging:
+  project: adaptive_chunk
+  entity: huiyuan_tac
+  group: null
+  id: null
+  mode: offline
+  name: threading_real_pointcloud_spatial_arp_block_grasp
+  tags:
+  - threading_real
+  - spatial_arp
+  - pointcloud
+  - block_grasp
+  - stride5
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    format_str: epoch={epoch:04d}-val_loss={val_loss:.3f}.ckpt
+    k: 3
+    mode: min
+    monitor_key: val_loss

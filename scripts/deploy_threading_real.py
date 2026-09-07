@@ -27,9 +27,6 @@ REPO_ROOT = PROJECT_ROOT.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "remote_controller" / "src"))
 
-from scripts.eval_policy import load_policy  # noqa: E402
-
-
 PANDA_LOWER = np.array(
     [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
     dtype=np.float64,
@@ -169,7 +166,7 @@ class ObservationFrame:
 
 
 class RealSenseRig:
-    """Three serial-pinned RealSense color streams matching data collection."""
+    """Three serial-pinned RealSense streams matching data collection."""
 
     def __init__(
         self,
@@ -180,6 +177,7 @@ class RealSenseRig:
         width: int = 640,
         height: int = 480,
         fps: int = 30,
+        enable_depth: bool = False,
     ):
         serials = (sideview_serial, wrist_serial, frontview_serial)
         if len(set(serials)) != len(serials):
@@ -193,18 +191,38 @@ class RealSenseRig:
             ) from exc
 
         self.rs = rs
+        self.enable_depth = bool(enable_depth)
         self.pipelines: list[Any] = []
+        self.aligners: list[Any] = []
+        self.color_intrinsics: list[dict[str, float]] = []
+        self.depth_scales: list[float] = []
         try:
             for serial in serials:
                 pipeline = rs.pipeline()
                 config = rs.config()
                 config.enable_device(serial)
                 config.enable_stream(rs.stream.color, width, height, rs.format.rgb8, fps)
-                pipeline.start(config)
+                if self.enable_depth:
+                    config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+                profile = pipeline.start(config)
                 self.pipelines.append(pipeline)
+                color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+                intrinsic = color_profile.get_intrinsics()
+                self.color_intrinsics.append({
+                    "width": int(intrinsic.width), "height": int(intrinsic.height),
+                    "fx": float(intrinsic.fx), "fy": float(intrinsic.fy),
+                    "ppx": float(intrinsic.ppx), "ppy": float(intrinsic.ppy),
+                })
+                if self.enable_depth:
+                    self.aligners.append(rs.align(rs.stream.color))
+                    sensor = profile.get_device().first_depth_sensor()
+                    self.depth_scales.append(float(sensor.get_depth_scale()))
             # Discard auto-exposure startup frames.
             for _ in range(10):
-                self.read(timeout_ms=2000)
+                if self.enable_depth:
+                    self.read_rgbd(timeout_ms=2000)
+                else:
+                    self.read(timeout_ms=2000)
         except Exception:
             self.close()
             raise
@@ -219,6 +237,21 @@ class RealSenseRig:
             frames.append(np.asanyarray(color.get_data()).copy())
         return frames[0], frames[1], frames[2]
 
+    def read_rgbd(self, timeout_ms: int = 1000):
+        if not self.enable_depth:
+            raise RuntimeError("RealSenseRig was not opened with enable_depth=True")
+        frames = []
+        for pipeline, aligner in zip(self.pipelines, self.aligners, strict=True):
+            frameset = aligner.process(pipeline.wait_for_frames(timeout_ms))
+            color, depth = frameset.get_color_frame(), frameset.get_depth_frame()
+            if not color or not depth:
+                raise RuntimeError("aligned RealSense frameset lacks RGB or depth")
+            frames.append((
+                np.asanyarray(color.get_data()).copy(),
+                np.asanyarray(depth.get_data()).copy(),
+            ))
+        return frames[0], frames[1], frames[2]
+
     def close(self) -> None:
         for pipeline in self.pipelines:
             try:
@@ -226,6 +259,7 @@ class RealSenseRig:
             except Exception:
                 pass
         self.pipelines.clear()
+        self.aligners.clear()
 
 
 class GripperController:
@@ -451,6 +485,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
 
 
 def run(args: argparse.Namespace) -> int:
+    from scripts.eval_policy import load_policy
+
     try:
         # Import the client module directly. Package-level ``remote_controller``
         # also imports the optional Pinocchio kinematics helper, which this

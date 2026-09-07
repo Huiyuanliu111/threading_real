@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from lerobot.configs.video import RGBEncoderConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
@@ -77,7 +78,7 @@ def convert(source: Path, output: Path, repo_id: str, stride: int, overwrite: bo
         features=features,
         use_videos=True,
         video_backend="pyav",
-        vcodec="libsvtav1",
+        rgb_encoder=RGBEncoderConfig(vcodec="libsvtav1", video_backend="pyav"),
     )
 
     total_frames = 0
