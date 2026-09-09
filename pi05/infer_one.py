@@ -17,7 +17,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--repo-id", default="threading_real/block_grasp_minimal_pi05_6hz")
+    parser.add_argument("--repo-id", default="threading_real/threading_combined_pi05_15hz_sg5_nozero")
     parser.add_argument("--frame", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()

@@ -13,7 +13,6 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 CAMERAS = {
     "observation.images.exterior_image_1_left",
     "observation.images.exterior_image_2_right",
-    "observation.images.wrist_image_left",
 }
 ACTION_NAMES = ["dx", "dy", "dz", "drotvec_x", "drotvec_y", "drotvec_z", "dgripper"]
 
@@ -21,16 +20,20 @@ ACTION_NAMES = ["dx", "dy", "dz", "drotvec_x", "drotvec_y", "drotvec_z", "dgripp
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--repo-id", default="threading_real/block_grasp_minimal_pi05_6hz")
+    parser.add_argument("--repo-id", default="threading_real/threading_combined_pi05_15hz_sg5_nozero")
     parser.add_argument("--chunk-size", type=int, default=10)
+    parser.add_argument("--expected-episodes", type=int, default=80)
+    parser.add_argument("--expected-fps", type=int, default=15)
     args = parser.parse_args()
 
     ds = LeRobotDataset(args.repo_id, root=args.dataset_root.expanduser().resolve(), video_backend="pyav")
     errors: list[str] = []
-    if ds.fps != 6:
-        errors.append(f"fps must be 6 after stride-5 downsampling, got {ds.fps}")
+    if ds.fps != args.expected_fps:
+        errors.append(f"fps must be {args.expected_fps}, got {ds.fps}")
     if set(ds.meta.camera_keys) != CAMERAS:
         errors.append(f"camera keys mismatch: {ds.meta.camera_keys}")
+    if ds.num_episodes != args.expected_episodes:
+        errors.append(f"expected {args.expected_episodes} episodes, got {ds.num_episodes}")
     if ds.meta.features["observation.state"]["shape"] != (8,):
         errors.append(f"state shape must be (8,), got {ds.meta.features['observation.state']['shape']}")
     if ds.meta.features["action"]["shape"] != (7,):

@@ -1,142 +1,161 @@
-# π0.5 全量微调：最小积木抓取
+# π0.5：两视角 Threading 微调
 
-这套脚本使用 Hugging Face LeRobot 的官方 π0.5 PyTorch 实现和
-`lerobot/pi05_base` 权重。选择该实现是因为现有数据已经是 LeRobot v3；当前
-`openpi` 主分支仍固定使用 LeRobot v2.1，不能直接读取本项目的数据。
+本目录使用 Hugging Face LeRobot 的 π0.5 实现和 `lerobot/pi05_base` 权重，
+训练任务为 `insert the grasped block through the needle`。
 
-训练环境固定到 LeRobot 官方提交
-`3f2c29ef7e44b1ddccbcda3b6a63939e53639e9e`。PyPI 最新稳定版 0.4.4 虽能训练
-π0.5，但它尚没有完整的 FSDP checkpoint/resume 路径；本服务器的两张空闲 A40
-各为 48 GB，全量微调必须使用官方主线新增的 FSDP2 支持。
+## 数据
 
-## 数据定义
+最终数据集默认位于：
 
-- 输入：三个 224×224 RGB 视角和 8 维状态（7 个关节角 + 夹爪宽度）。
-- 输出：7 维 Cartesian 增量（`dx,dy,dz,drotvec_x,drotvec_y,drotvec_z,dgripper`）。
-- 控制频率：6 Hz。
-- action chunk：10 步（1.67 秒），推理时每次先执行 2 步再重规划。
-- 提示词：`pick up the block`。
-
-原 `cartesian_stride5_224` 数据中的动作已经是 `t -> t+5`，但视频和状态仍为
-30 Hz。必须先真正降采样到 6 Hz，否则 π0.5 的相邻 chunk 动作会重叠。
-
-## 1. 传到远端
-
-训练服务器：`huiyuan@10.157.174.249`。远端项目目录默认使用
-`/home/huiyuan/teleoperation`。在本机执行：
-
-```bash
-ssh huiyuan@10.157.174.249 'mkdir -p /home/huiyuan/teleoperation/threading_real/pi05 /home/huiyuan/teleoperation/data/block_grasp_minimal_pi05_6hz'
-
-rsync -av --progress threading_real/pi05/ \
-  huiyuan@10.157.174.249:/home/huiyuan/teleoperation/threading_real/pi05/
-rsync -av --progress data/block_grasp_minimal_pi05_6hz/ \
-  huiyuan@10.157.174.249:/home/huiyuan/teleoperation/data/block_grasp_minimal_pi05_6hz/
+```text
+data/threading_combined_pi05_15hz_sg5_nozero
 ```
 
-这里不自动登录或修改远端服务器。
+数据由 `data/threading_new_1` 和 `data/threading_new_2` 动态发现并合并，当前应为
+80 个 episode。处理流程为：
 
-如果远端实际采用当前终端里的 `~/pi05/pi05`（脚本）和 `~/pi05/data`（数据）布局，
-训练脚本也会自动识别，不必搬到 `/home/huiyuan/teleoperation`。
+1. 以主机单调时钟对齐机器人状态与 cam1/cam3；
+2. 图像编码为两个 224×224 RGB 视角；
+3. 关节目标通过 Panda FK 转为基座坐标系 TCP delta；
+4. 对重建的平移轨迹应用 Savitzky–Golay `(window=5, polyorder=2)` 滤波；
+5. 计算 `t -> t+2` 动作并从 30 Hz 降采样到 15 Hz；
+6. 删除平移 `<1 mm`、旋转 `<0.01 rad` 且夹爪变化 `<0.5 mm` 的动作。
 
-## 2. 安装环境
-
-登录并在远端项目根目录手动执行：
+生成数据：
 
 ```bash
-ssh huiyuan@10.157.174.249
 cd /home/huiyuan/teleoperation
-PYTHON_BIN=python3.12 bash threading_real/pi05/bootstrap_remote.sh
+.venv-smolvla/bin/python threading_real/pi05/build_combined_dataset.py \
+  --raw-root data/threading_new_1 \
+  --raw-root data/threading_new_2 \
+  --expected-episodes 80
+```
+
+流水线成功后会删除中间 LeRobot 数据；增加 `--keep-intermediates` 可保留中间结果。
+所有输出目录均拒绝覆盖已有内容。
+
+单独检查最终数据：
+
+```bash
+.venv-smolvla/bin/python threading_real/pi05/preflight.py \
+  --dataset-root data/threading_combined_pi05_15hz_sg5_nozero \
+  --expected-episodes 80
+```
+
+## 训练
+
+训练服务器默认使用 GPU 4、5 两张 48 GB A40，并通过两卡 DDP 训练。默认预测并执行
+完整的 10 帧 action chunk（15 Hz 下约 0.67 秒）；按 episode 留出 20% 数据计算
+validation loss。小数据集
+默认设置 `TRAIN_EXPERT_ONLY=true`，冻结 VLM 并训练 action expert，以减轻过拟合。
+
+```bash
+cd /home/huiyuan/teleoperation
 source .venv-pi05/bin/activate
-hf auth login
-```
-
-固定版本要求 Python 3.12。若系统没有 `python3.12`，可先用 Conda 创建环境，再让
-脚本使用该解释器；不要退回安装 `lerobot==0.4.4`：
-
-```bash
-conda create -n threading_pi05 python=3.12 -y
-PYTHON_BIN="$(conda run -n threading_pi05 which python)" \
-  bash threading_real/pi05/bootstrap_remote.sh
-```
-
-π0.5 使用 gated 的 `google/paligemma-3b-pt-224` tokenizer。训练前需要在
-Hugging Face 页面接受许可，并登录有权限的账号。
-
-全量微调没有冻结视觉编码器或 VLM。服务器上 GPU 4、5 是两张空闲的 48 GB
-NVIDIA A40，脚本默认只暴露这两张卡并用 FSDP2 对参数、梯度和优化器状态做全分片。
-两卡之间为同一 NUMA 节点的 `NODE` PCIe 路径，没有 NVLink，因此能训练但通信速度
-会慢于 A100/H100 NVLink 机器。默认每卡 batch size 为 1，有效 batch size 为 2。
-
-## 3. 生成或检查 6 Hz 数据
-
-本机已经生成 `data/block_grasp_minimal_pi05_6hz`，按上面的命令传输后只需执行
-`preflight.py`。如果需要在远端从 30 Hz 数据重新生成，再执行转换命令：
-
-```bash
-python threading_real/pi05/prepare_dataset.py \
-  --source data/block_grasp_minimal_lerobot_v3_cartesian_stride5_224 \
-  --output data/block_grasp_minimal_pi05_6hz
-
-python threading_real/pi05/preflight.py \
-  --dataset-root data/block_grasp_minimal_pi05_6hz
-```
-
-转换器不会覆盖已有输出。确实需要重建时显式增加 `--overwrite`。
-
-## 4. 全量微调
-
-```bash
-source .venv-pi05/bin/activate
-GPU_IDS=4,5 BATCH_SIZE=1 STEPS=3000 SAVE_FREQ=500 \
+GPU_IDS=4,5 BATCH_SIZE=1 STEPS=15000 SAVE_FREQ=5000 EVAL_FREQ=500 \
   bash threading_real/pi05/train_full.sh
 ```
 
-默认关闭 W&B 和 Hub 上传。每 500 step 保存可直接推理的 safetensors；FSDP
-优化器状态仍以 DCP 分片保存并支持续训。没有额外再保存一份模型 DCP，以减少磁盘
-占用。20 条示范很少，建议比较 500、1000、1500、2000、2500、3000 step 的实机
-成功率，不要只选训练 loss 最低的检查点。
+loss 默认同步到 W&B 项目 `threading_pi05`。关闭同步可设置
+`WANDB_ENABLE=false`。做全参数微调可设置 `TRAIN_EXPERT_ONLY=false`，但应与默认的
+expert-only 训练分别保存并比较验证集和实机成功率。
 
-先做 2 step 启动测试，确认日志出现 `dp_shard=2`，并观察两卡显存：
+训练脚本固定：
 
-```bash
-GPU_IDS=4,5 STEPS=2 SAVE_FREQ=2 \
-  OUTPUT_DIR="$PWD/threading_real/pi05/outputs/fsdp_smoke" \
-  bash threading_real/pi05/train_full.sh
-```
+- `chunk_size=10`
+- `n_action_steps=10`
+- `eval_split=0.2`
+- 每 500 step 在固定的 512 个验证样本上计算 loss
+- 每 5000 step 保存 checkpoint（15000 steps 共保存 3 份）
+- bfloat16、gradient checkpointing、两卡 DDP
 
-另开终端观察：
-
-```bash
-watch -n 1 'nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv'
-```
-
-不要使用 GPU 0、1、2、3、6，也不要终止占用这些卡的 PID `1941144`。
-
-断点续训使用 LeRobot 保存的配置（将路径改成实际 run）：
+首次在训练服务器配置环境：
 
 ```bash
-CUDA_VISIBLE_DEVICES=4,5 torchrun --standalone --nproc-per-node=2 "$(which lerobot-train)" \
-  --config_path=threading_real/pi05/outputs/block_grasp_minimal_full/checkpoints/last/pretrained_model/train_config.json \
-  --resume=true
+cd ~/pi05
+curl -LsSf https://astral.sh/uv/install.sh | sh  # 仅在尚未安装 uv 时执行
+source "$HOME/.local/bin/env"
+bash pi05/bootstrap_remote.sh
+source .venv-pi05/bin/activate
+read -r -s -p "HF token: " HF_TOKEN; echo
+export HF_TOKEN
 ```
 
-## 5. 单帧推理冒烟测试
+环境固定创建在 `~/pi05/.venv-pi05`。安装使用 `uv --no-cache`，避免在空间紧张的
+根分区额外保留一份 wheel 缓存。
+
+训练脚本把 Hugging Face 和 W&B 缓存固定在项目的 `.cache/` 下，避免同一用户的
+多个缓存目录重复下载权重。目标服务器只剩约 62 GiB 时，不要把 `SAVE_FREQ` 改回
+500；默认 5000 只生成 step 5000、10000、15000 三份 checkpoint。训练前后可用
+`df -h "$HOME"` 和 `du -sh ~/pi05/* ~/pi05/.cache/*` 检查占用。
+
+GPU 被其他任务占用时，可在远端后台等待 GPU 4、5。脚本要求连续三次检查（默认
+每 30 秒一次）均有至少 40000 MiB 空闲显存且利用率不超过 5%，并在启动前再次
+检查磁盘至少剩余 45 GiB：
+
+```bash
+mkdir -p ~/pi05/logs
+read -r -s -p "HF token: " HF_TOKEN; echo
+export HF_TOKEN
+nohup setsid bash ~/pi05/pi05/wait_for_gpus_and_train.sh \
+  > ~/pi05/logs/wait-and-train.log 2>&1 &
+echo $! > ~/pi05/wait-and-train.pid
+unset HF_TOKEN
+tail -f ~/pi05/logs/wait-and-train.log
+```
+
+停止尚未启动训练的等待任务：
+
+```bash
+kill -- "-$(cat ~/pi05/wait-and-train.pid)"
+```
+
+π0.5 需要访问 gated 的 `google/paligemma-3b-pt-224`。训练前必须在 Hugging Face
+接受许可并登录。
+
+## Checkpoint 推理检查
 
 ```bash
 python threading_real/pi05/infer_one.py \
-  --checkpoint threading_real/pi05/outputs/block_grasp_minimal_full/checkpoints/last/pretrained_model \
-  --dataset-root data/block_grasp_minimal_pi05_6hz \
+  --checkpoint threading_real/pi05/outputs/threading_combined_pi05/checkpoints/last/pretrained_model \
+  --dataset-root data/threading_combined_pi05_15hz_sg5_nozero \
   --frame 0
 ```
 
-输出是已经反归一化的 10×7 Cartesian action chunk。接入实机前应继续沿用现有
-部署脚本的平移/旋转限幅和急停逻辑，并先在不使能机器人时检查动作分布。
+输出为反归一化后的 `10×7` Cartesian action chunk。
 
-## 版本
+## Soft Chunk Selector
 
-脚本固定到上述 LeRobot Git commit，并使用其原生 FSDP2 checkpoint 路径。若升级
-LeRobot，请先重新运行 `preflight.py` 和 `infer_one.py`；训练 CLI 与 checkpoint
-processor 格式可能变化。
-训练脚本显式使用 `pyav` 解码视频，以免远端 PyTorch、TorchCodec 与系统 FFmpeg
-的二进制版本不匹配。
+Selector 与 π0.5 分开训练。先从真实机器人 Cartesian 动作生成 `{4,10}` 的概率标签：
+
+```bash
+python threading_real/scripts/label_lerobot_tcp_chunks.py \
+  --dataset data/threading_combined_pi05_15hz_sg5_nozero \
+  --output data/threading_combined_pi05_15hz_sg5_nozero_tcp_chunk_soft_labels_4_10_smoothed \
+  --candidate-chunks 4 10 \
+  --smoothing-window 5 \
+  --label-smoothing-window 3
+```
+
+使用训练完成的 π0.5 checkpoint 提取冻结的两相机视觉 token。默认把每路 SigLIP
+token 池化为 `4×4`，每帧共缓存 32 个 token：
+
+```bash
+python threading_real/pi05/extract_selector_features.py \
+  --checkpoint threading_real/pi05/outputs/threading_combined_pi05/checkpoints/last/pretrained_model \
+  --dataset-root data/threading_combined_pi05_15hz_sg5_nozero \
+  --labels data/threading_combined_pi05_15hz_sg5_nozero_tcp_chunk_soft_labels_4_10_smoothed/labels.parquet \
+  --output data/threading_combined_pi05_selector_soft_4_10.hdf5
+```
+
+最后只训练 selector sidecar。模型学习 `p(chunk=4)` 和 `p(chunk=10)`，推理时使用
+`4*p4 + 10*p10` 得到连续 chunk，再四舍五入为 4 到 10 的执行步数：
+
+```bash
+python threading_real/scripts/train_chunk_selector.py \
+  data/threading_combined_pi05_selector_soft_4_10.hdf5 \
+  --output-dir threading_real/pi05/outputs/selector_soft_4_10 \
+  --use-target-probabilities \
+  --selection-mode expected \
+  --no-class-weights
+```
