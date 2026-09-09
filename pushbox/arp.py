@@ -1057,6 +1057,9 @@ class Upsample2DAttnPredictor(TokenPredictorInterface):
                     label = (label[..., 0] * w) + label[..., 1]
                 else:
                     raise ValueError("token_format should be 'xy' or 'hw'")
+                # Spatial control points are continuous before projection; the
+                # raster cell used by cross entropy is a discrete class index.
+                label = label.round().long()
             
             result = {'2d_ce_loss': [self._cross_entropy_loss(spatial_logits_map.flatten(1), label)]}
             if log_prob:

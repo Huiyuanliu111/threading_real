@@ -54,6 +54,7 @@ def _validate_v3(
     action_key: str,
     expected_state_dim: int | None,
     expected_action_dim: int | None,
+    expected_fps: float | None,
     max_episodes: int | None,
 ) -> dict:
     """Validate official v3 shards and decode one frame from each checked episode."""
@@ -155,8 +156,8 @@ def _validate_v3(
             {"episode_index": episode_id, "frames": len(episode_rows), "cameras": camera_report}
         )
 
-    if info.get("fps") != 30:
-        warnings.append(f"expected vla_finetune 30 FPS, got {info.get('fps')}")
+    if expected_fps is not None and float(info.get("fps", -1)) != expected_fps:
+        warnings.append(f"expected {expected_fps:g} FPS, got {info.get('fps')}")
     return {
         "dataset": str(root),
         "codebase_version": info.get("codebase_version"),
@@ -180,6 +181,7 @@ def validate(
     action_key: str,
     expected_state_dim: int | None,
     expected_action_dim: int | None,
+    expected_fps: float | None,
     max_episodes: int | None,
 ) -> dict:
     errors: list[str] = []
@@ -198,6 +200,7 @@ def validate(
             action_key,
             expected_state_dim,
             expected_action_dim,
+            expected_fps,
             max_episodes,
         )
     features = info.get("features", {})
@@ -261,8 +264,8 @@ def validate(
                 errors.append(f"{video_path}: invalid video size")
         episodes.append(episode_report)
 
-    if info.get("fps") != 30:
-        warnings.append(f"expected Record_layer 30 FPS, got {info.get('fps')}")
+    if expected_fps is not None and float(info.get("fps", -1)) != expected_fps:
+        warnings.append(f"expected {expected_fps:g} FPS, got {info.get('fps')}")
     return {
         "dataset": str(root),
         "codebase_version": info.get("codebase_version"),
@@ -287,6 +290,7 @@ def main() -> int:
     parser.add_argument("--action-key", default="action")
     parser.add_argument("--expected-state-dim", type=int, default=8)
     parser.add_argument("--expected-action-dim", type=int, default=8)
+    parser.add_argument("--expected-fps", type=float, default=30.0)
     parser.add_argument("--max-episodes", type=int)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -297,6 +301,7 @@ def main() -> int:
         args.action_key,
         args.expected_state_dim,
         args.expected_action_dim,
+        args.expected_fps,
         args.max_episodes,
     )
     text = json.dumps(report, indent=2, ensure_ascii=False)
