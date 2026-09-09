@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import threading
@@ -16,6 +17,51 @@ assert SPEC is not None and SPEC.loader is not None
 runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
 SPEC.loader.exec_module(runner)
+
+
+def test_synchronous_execution_is_default() -> None:
+    parser = runner.build_parser()
+
+    defaults = parser.parse_args(["checkpoint"])
+    assert defaults.synchronous is True
+    assert defaults.episodes == 1
+    assert parser.parse_args(["checkpoint", "--no-synchronous"]).synchronous is False
+    assert parser.parse_args(["checkpoint", "--episodes", "10"]).episodes == 10
+
+
+def test_auto_detects_pi05_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "config.json").write_text(json.dumps({"type": "pi05"}))
+    sentinel = object()
+    monkeypatch.setattr(runner, "PI05DeploymentPolicy", lambda *args, **kwargs: sentinel)
+
+    policy = runner.load_deployment_policy(
+        tmp_path,
+        device="cpu",
+        weights="model",
+        policy_kind="auto",
+        task="insert the grasped block through the needle",
+    )
+
+    assert policy is sentinel
+
+
+def test_adaptive_pi05_parser_modes() -> None:
+    parser = runner.build_parser()
+    required = parser.parse_args(
+        [
+            "checkpoint",
+            "--chunk-selector",
+            "selector",
+            "--prediction-mode",
+            "required_only",
+            "--trace-output",
+            "trace.jsonl",
+        ]
+    )
+
+    assert required.chunk_selector == Path("selector")
+    assert required.prediction_mode == "required_only"
+    assert required.trace_output == Path("trace.jsonl")
 
 
 def test_cartesian_pose_error() -> None:

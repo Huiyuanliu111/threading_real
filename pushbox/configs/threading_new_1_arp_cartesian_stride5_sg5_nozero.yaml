@@ -1,0 +1,16 @@
+# Two-view real-robot Threading data, sampled at 6 Hz after Savitzky-Golay
+# translation filtering and removal of near-zero actions.
+defaults:
+  - threading_real_arp_cartesian_stride5_smooth5
+  - _self_
+
+name: threading_new_1_arp_cartesian_stride5_sg5_nozero
+
+task:
+  dataset:
+    dataset_path: /home/huiyuan/teleoperation/data/threading_new_1_smolvla_6hz_sg5_nozero
+
+logging:
+  mode: offline
+  name: threading_new_1_arp_cartesian_stride5_sg5_nozero
+  tags: [threading_real, threading_only, two_view, cartesian_delta, stride5, savgol5, nozero, frozen_visual]

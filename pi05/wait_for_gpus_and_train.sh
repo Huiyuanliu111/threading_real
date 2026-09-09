@@ -8,7 +8,7 @@ else
   PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 fi
 
-GPU_IDS=${GPU_IDS:-4,5}
+GPU_IDS=${GPU_IDS:-0,1,3,4,5,6}
 MIN_FREE_MIB=${MIN_FREE_MIB:-40000}
 MAX_UTIL_PERCENT=${MAX_UTIL_PERCENT:-5}
 POLL_SECONDS=${POLL_SECONDS:-30}
@@ -36,12 +36,6 @@ export HF_HOME=${HF_HOME:-${PROJECT_ROOT}/.cache/huggingface}
 export WANDB_DIR=${WANDB_DIR:-${PROJECT_ROOT}/.cache/wandb}
 mkdir -p "${HF_HOME}" "${WANDB_DIR}"
 
-if [[ -z "${HF_TOKEN:-}" ]]; then
-  echo "HF_TOKEN is not set. Read and export it before starting this watcher:" >&2
-  echo "  read -r -s -p 'HF token: ' HF_TOKEN; echo; export HF_TOKEN" >&2
-  exit 2
-fi
-
 # Check the exact gated dependency before waiting hours for GPUs. `hf auth
 # whoami` alone is insufficient because a valid token may still lack approval
 # for PaliGemma.
@@ -55,7 +49,7 @@ hf_hub_download(
 print("Hugging Face access check passed: google/paligemma-3b-pt-224")
 PY
 then
-  echo "PaliGemma access check failed. HF_TOKEN is invalid or lacks gated-repo access." >&2
+  echo "PaliGemma access failed; log in with huggingface-cli or set an authorized HF_TOKEN." >&2
   exit 2
 fi
 if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -121,10 +115,20 @@ echo "GPUs remained available; starting pi05 training at $(date --iso-8601=secon
 
 exec env \
   GPU_IDS="${GPU_IDS}" \
+  NUM_PROCESSES="${NUM_PROCESSES:-6}" \
   BATCH_SIZE="${BATCH_SIZE:-1}" \
-  STEPS="${STEPS:-15000}" \
-  SAVE_FREQ="${SAVE_FREQ:-5000}" \
-  EVAL_FREQ="${EVAL_FREQ:-500}" \
+  GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-2}" \
+  STEPS="${STEPS:-20000}" \
+  SAVE_FREQ="${SAVE_FREQ:-10000}" \
+  EVAL_FREQ="${EVAL_FREQ:-1000}" \
   MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-512}" \
-  TRAIN_EXPERT_ONLY="${TRAIN_EXPERT_ONLY:-true}" \
+  FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-false}" \
+  TRAIN_EXPERT_ONLY="${TRAIN_EXPERT_ONLY:-false}" \
+  PROPRIOCEPTION_DROPOUT="${PROPRIOCEPTION_DROPOUT:-0.0}" \
+  IGNORE_GRIPPER_ACTION="${IGNORE_GRIPPER_ACTION:-true}" \
+  FINETUNE_MODE="${FINETUNE_MODE:-visual_expert}" \
+  VISION_LR_SCALE="${VISION_LR_SCALE:-0.1}" \
+  LOG_FREQ="${LOG_FREQ:-20}" \
+  SCHEDULER_WARMUP_STEPS="${SCHEDULER_WARMUP_STEPS:-1000}" \
+  SCHEDULER_DECAY_STEPS="${SCHEDULER_DECAY_STEPS:-20000}" \
   bash "${SCRIPT_DIR}/train_full.sh"

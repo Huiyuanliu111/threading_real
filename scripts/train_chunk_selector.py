@@ -83,12 +83,14 @@ def _run_epoch(
     optimizer: torch.optim.Optimizer | None,
     class_weights: torch.Tensor | None,
     soft_target_temperature: float | None,
+    use_target_probabilities: bool,
 ) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
     losses: list[float] = []
     predictions: list[np.ndarray] = []
     targets: list[np.ndarray] = []
+    chunk_absolute_errors: list[np.ndarray] = []
 
     context = torch.enable_grad if training else torch.inference_mode
     with context():
@@ -106,6 +108,30 @@ def _run_epoch(
                 reduction="none",
             )
             losses_per_sample = hard_losses
+            if use_target_probabilities:
+                soft_targets = batch["target_probabilities"].to(device, non_blocking=True)
+                has_soft_targets = batch["has_target_probabilities"].to(
+                    device, non_blocking=True
+                )
+                safe_targets = torch.where(
+                    torch.isfinite(soft_targets),
+                    soft_targets,
+                    torch.zeros_like(soft_targets),
+                )
+                soft_losses = -(safe_targets * F.log_softmax(logits, dim=-1)).sum(dim=-1)
+                losses_per_sample = torch.where(
+                    has_soft_targets,
+                    soft_losses,
+                    hard_losses,
+                )
+                chunk_values = torch.as_tensor(
+                    model.candidate_chunks, device=device, dtype=logits.dtype
+                )
+                predicted_chunks = torch.softmax(logits, dim=-1) @ chunk_values
+                target_chunks = safe_targets @ chunk_values
+                chunk_absolute_errors.append(
+                    (predicted_chunks - target_chunks).abs().detach().cpu().numpy()
+                )
             if soft_target_temperature is not None:
                 utilities = batch["utilities"].to(device, non_blocking=True)
                 has_utilities = batch["has_utilities"].to(device, non_blocking=True)
@@ -140,7 +166,7 @@ def _run_epoch(
 
     all_predictions = np.concatenate(predictions)
     all_targets = np.concatenate(targets)
-    return {
+    metrics = {
         "loss": float(np.mean(losses)),
         "accuracy": float((all_predictions == all_targets).mean()),
         "macro_f1": _macro_f1(
@@ -149,6 +175,9 @@ def _run_epoch(
             len(model.candidate_chunks),
         ),
     }
+    if chunk_absolute_errors:
+        metrics["chunk_mae"] = float(np.concatenate(chunk_absolute_errors).mean())
+    return metrics
 
 
 def main() -> int:
@@ -178,6 +207,17 @@ def main() -> int:
         help="use utility-derived soft labels where available",
     )
     parser.add_argument(
+        "--use-target-probabilities",
+        action="store_true",
+        help="train from explicit target_probabilities stored in the feature dataset",
+    )
+    parser.add_argument(
+        "--selection-mode",
+        choices=("argmax", "expected"),
+        default="argmax",
+        help="map predicted probabilities to a candidate or their expected chunk",
+    )
+    parser.add_argument(
         "--no-class-weights",
         action="store_true",
         help="disable inverse-frequency class weighting",
@@ -188,6 +228,10 @@ def main() -> int:
         parser.error("epochs, batch-size, and patience must be positive")
     if args.soft_target_temperature is not None and args.soft_target_temperature <= 0:
         parser.error("--soft-target-temperature must be positive")
+    if args.use_target_probabilities and args.soft_target_temperature is not None:
+        parser.error(
+            "--use-target-probabilities and --soft-target-temperature are mutually exclusive"
+        )
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -197,6 +241,17 @@ def main() -> int:
 
     dataset_path = args.dataset.expanduser().resolve()
     dataset = ChunkFeatureDataset(dataset_path)
+    if args.use_target_probabilities:
+        with h5py.File(dataset_path, "r") as h5:
+            if "target_probabilities" not in h5:
+                parser.error("dataset does not contain target_probabilities")
+            targets = np.asarray(h5["target_probabilities"])
+            if not (
+                np.isfinite(targets).all()
+                and np.all(targets >= 0.0)
+                and np.allclose(targets.sum(axis=1), 1.0, atol=1e-5)
+            ):
+                parser.error("dataset target_probabilities are missing or invalid")
     train_indices, val_indices = episode_split_indices(
         dataset_path,
         val_ratio=args.val_ratio,
@@ -232,10 +287,14 @@ def main() -> int:
         max_tokens=token_count,
         safe_chunk=args.safe_chunk,
         confidence_threshold=args.confidence_threshold,
+        selection_mode=args.selection_mode,
         metadata={
             **dataset.metadata,
             "training_dataset": str(dataset_path),
             "training_seed": args.seed,
+            "training_targets": (
+                "explicit_probabilities" if args.use_target_probabilities else "hard_labels"
+            ),
         },
         **embedding_sizes,
     )
@@ -257,7 +316,8 @@ def main() -> int:
         class_weights = torch.as_tensor(weights, device=device, dtype=torch.float32)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     history: list[dict[str, Any]] = []
-    best_f1 = -1.0
+    best_score = -float("inf")
+    best_epoch = 0
     epochs_without_improvement = 0
     for epoch in range(1, args.epochs + 1):
         train_metrics = _run_epoch(
@@ -267,6 +327,7 @@ def main() -> int:
             optimizer=optimizer,
             class_weights=class_weights,
             soft_target_temperature=args.soft_target_temperature,
+            use_target_probabilities=args.use_target_probabilities,
         )
         val_metrics = _run_epoch(
             model,
@@ -275,6 +336,7 @@ def main() -> int:
             optimizer=None,
             class_weights=class_weights,
             soft_target_temperature=args.soft_target_temperature,
+            use_target_probabilities=args.use_target_probabilities,
         )
         record = {"epoch": epoch, "train": train_metrics, "validation": val_metrics}
         history.append(record)
@@ -284,16 +346,28 @@ def main() -> int:
             f"val_loss={val_metrics['loss']:.4f} "
             f"val_acc={val_metrics['accuracy']:.3f} "
             f"val_macro_f1={val_metrics['macro_f1']:.3f}"
+            + (
+                f" val_chunk_mae={val_metrics['chunk_mae']:.3f}"
+                if "chunk_mae" in val_metrics
+                else ""
+            )
         )
-        if val_metrics["macro_f1"] > best_f1:
-            best_f1 = val_metrics["macro_f1"]
+        score = (
+            -val_metrics["loss"]
+            if args.use_target_probabilities
+            else val_metrics["macro_f1"]
+        )
+        if score > best_score:
+            best_score = score
+            best_epoch = epoch
             epochs_without_improvement = 0
             model.eval()
             model.save_pretrained(
                 args.output_dir,
                 metadata={
                     "best_epoch": str(epoch),
-                    "best_validation_macro_f1": str(best_f1),
+                    "best_validation_loss": str(val_metrics["loss"]),
+                    "best_validation_macro_f1": str(val_metrics["macro_f1"]),
                 },
             )
         else:
@@ -306,7 +380,7 @@ def main() -> int:
         json.dumps(history, indent=2) + "\n",
         encoding="utf-8",
     )
-    print(f"best validation macro-F1={best_f1:.3f}")
+    print(f"best epoch={best_epoch}")
     print(f"selector saved to {args.output_dir.resolve()}")
     return 0
 

@@ -157,16 +157,16 @@ def choose_gripper_transition(
 
 @dataclass
 class ObservationFrame:
-    sideview: torch.Tensor
-    wrist: torch.Tensor
-    frontview: torch.Tensor
+    sideview: torch.Tensor | None
+    wrist: torch.Tensor | None
+    frontview: torch.Tensor | None
     agent_pos: torch.Tensor
     timestamp: float
     tcp_pos: torch.Tensor | None = None
 
 
 class RealSenseRig:
-    """Three serial-pinned RealSense streams matching data collection."""
+    """Serial-pinned RealSense streams matching the checkpoint camera set."""
 
     def __init__(
         self,
@@ -178,10 +178,20 @@ class RealSenseRig:
         height: int = 480,
         fps: int = 30,
         enable_depth: bool = False,
+        enabled_views: tuple[str, ...] = ("sideview", "wrist", "frontview"),
     ):
-        serials = (sideview_serial, wrist_serial, frontview_serial)
+        serial_by_view = {
+            "sideview": sideview_serial,
+            "wrist": wrist_serial,
+            "frontview": frontview_serial,
+        }
+        unknown = set(enabled_views) - set(serial_by_view)
+        if unknown:
+            raise ValueError(f"unknown RealSense views: {sorted(unknown)}")
+        self.view_names = tuple(enabled_views)
+        serials = tuple(serial_by_view[name] for name in self.view_names)
         if len(set(serials)) != len(serials):
-            raise ValueError("sideview, wrist, and frontview cameras must use distinct serial numbers")
+            raise ValueError("enabled RealSense views must use distinct serial numbers")
         try:
             import pyrealsense2 as rs
         except ImportError as exc:
@@ -227,30 +237,32 @@ class RealSenseRig:
             self.close()
             raise
 
-    def read(self, timeout_ms: int = 1000) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        frames = []
-        for pipeline in self.pipelines:
+    def read(self, timeout_ms: int = 1000) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        frames = {}
+        for name, pipeline in zip(self.view_names, self.pipelines, strict=True):
             frameset = pipeline.wait_for_frames(timeout_ms)
             color = frameset.get_color_frame()
             if not color:
                 raise RuntimeError("RealSense frameset has no color frame")
-            frames.append(np.asanyarray(color.get_data()).copy())
-        return frames[0], frames[1], frames[2]
+            frames[name] = np.asanyarray(color.get_data()).copy()
+        return frames.get("sideview"), frames.get("wrist"), frames.get("frontview")
 
     def read_rgbd(self, timeout_ms: int = 1000):
         if not self.enable_depth:
             raise RuntimeError("RealSenseRig was not opened with enable_depth=True")
-        frames = []
-        for pipeline, aligner in zip(self.pipelines, self.aligners, strict=True):
+        frames = {}
+        for name, pipeline, aligner in zip(
+            self.view_names, self.pipelines, self.aligners, strict=True
+        ):
             frameset = aligner.process(pipeline.wait_for_frames(timeout_ms))
             color, depth = frameset.get_color_frame(), frameset.get_depth_frame()
             if not color or not depth:
                 raise RuntimeError("aligned RealSense frameset lacks RGB or depth")
-            frames.append((
+            frames[name] = (
                 np.asanyarray(color.get_data()).copy(),
                 np.asanyarray(depth.get_data()).copy(),
-            ))
-        return frames[0], frames[1], frames[2]
+            )
+        return frames.get("sideview"), frames.get("wrist"), frames.get("frontview")
 
     def close(self) -> None:
         for pipeline in self.pipelines:
@@ -299,9 +311,9 @@ class GripperController:
 
 
 def make_observation(
-    sideview_rgb: np.ndarray,
-    wrist_rgb: np.ndarray,
-    frontview_rgb: np.ndarray,
+    sideview_rgb: np.ndarray | None,
+    wrist_rgb: np.ndarray | None,
+    frontview_rgb: np.ndarray | None,
     q: Sequence[float],
     gripper_width: float,
     image_size: int,
@@ -317,20 +329,13 @@ def make_observation(
         pre_resize_image_size = int(pre_resize_image_size)
         if pre_resize_image_size <= 0:
             raise ValueError("pre_resize_image_size must be positive")
-        sideview_rgb = cv2.resize(
-            sideview_rgb,
-            (pre_resize_image_size, pre_resize_image_size),
-            interpolation=cv2.INTER_AREA,
-        )
-        wrist_rgb = cv2.resize(
-            wrist_rgb,
-            (pre_resize_image_size, pre_resize_image_size),
-            interpolation=cv2.INTER_AREA,
-        )
-        frontview_rgb = cv2.resize(
-            frontview_rgb,
-            (pre_resize_image_size, pre_resize_image_size),
-            interpolation=cv2.INTER_AREA,
+        sideview_rgb, wrist_rgb, frontview_rgb = (
+            None if image is None else cv2.resize(
+                image,
+                (pre_resize_image_size, pre_resize_image_size),
+                interpolation=cv2.INTER_AREA,
+            )
+            for image in (sideview_rgb, wrist_rgb, frontview_rgb)
         )
     tcp_tensor = None
     if tcp_position is not None:
@@ -339,9 +344,9 @@ def make_observation(
             raise ValueError(f"invalid TCP position: {tcp}")
         tcp_tensor = torch.from_numpy(tcp)
     return ObservationFrame(
-        sideview=image_to_policy_tensor(sideview_rgb, image_size),
-        wrist=image_to_policy_tensor(wrist_rgb, image_size),
-        frontview=image_to_policy_tensor(frontview_rgb, image_size),
+        sideview=None if sideview_rgb is None else image_to_policy_tensor(sideview_rgb, image_size),
+        wrist=None if wrist_rgb is None else image_to_policy_tensor(wrist_rgb, image_size),
+        frontview=None if frontview_rgb is None else image_to_policy_tensor(frontview_rgb, image_size),
         agent_pos=torch.from_numpy(state),
         timestamp=time.monotonic(),
         tcp_pos=tcp_tensor,
@@ -349,16 +354,18 @@ def make_observation(
 
 
 def stack_observations(
-    history: Sequence[ObservationFrame], device: str
+    history: Sequence[ObservationFrame],
+    device: str,
+    rgb_keys: Sequence[str] = ("sideview", "wrist", "frontview"),
 ) -> dict[str, torch.Tensor]:
     if not history:
         raise ValueError("observation history is empty")
-    result = {
-        "sideview": torch.stack([frame.sideview for frame in history]).unsqueeze(0).to(device),
-        "wrist": torch.stack([frame.wrist for frame in history]).unsqueeze(0).to(device),
-        "frontview": torch.stack([frame.frontview for frame in history]).unsqueeze(0).to(device),
-        "agent_pos": torch.stack([frame.agent_pos for frame in history]).unsqueeze(0).to(device),
-    }
+    result = {"agent_pos": torch.stack([frame.agent_pos for frame in history]).unsqueeze(0).to(device)}
+    for key in rgb_keys:
+        values = [getattr(frame, key) for frame in history]
+        if any(value is None for value in values):
+            raise ValueError(f"camera {key!r} is missing from observation history")
+        result[key] = torch.stack(values).unsqueeze(0).to(device)
     tcp_values = [frame.tcp_pos for frame in history]
     if any(value is not None for value in tcp_values):
         if not all(value is not None for value in tcp_values):

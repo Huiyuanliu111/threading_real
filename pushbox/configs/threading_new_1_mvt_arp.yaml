@@ -1,0 +1,100 @@
+name: threading_new_1_mvt_arp
+_target_: pushbox.workspace.PushBoxARPWorkspace
+
+task:
+  name: threading_new_1_mvt_arp
+  dataset:
+    _target_: threading_task.mvt_dataset.ThreadingMVTDataset
+    dataset_path: /home/huiyuan/teleoperation/data/threading_new_1_mvt_6hz_sg5_nozero.h5
+    urdf_path: /home/huiyuan/teleoperation/remote_controller/src/remote_controller/assets/panda/panda_arm.urdf
+    horizon: 10
+    n_obs_steps: 1
+    val_ratio: 0.2
+    seed: 42
+    axis_length: 0.04
+  shape_meta:
+    action: {shape: [7]}
+    obs:
+      points: {shape: [131072, 3], type: low_dim}
+      colors: {shape: [131072, 3], type: low_dim}
+      valid_points: {shape: [1], type: low_dim}
+      agent_pos: {shape: [8], type: low_dim}
+      control_points: {shape: [3, 3], type: low_dim}
+
+dataloader:
+  batch_size: 2
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+  shuffle: true
+
+val_dataloader:
+  batch_size: 2
+  num_workers: 2
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+  shuffle: false
+
+policy:
+  _target_: threading_task.mvt_arp_policy.ThreadingMVTARPPolicy
+  horizon: 10
+  n_action_steps: 5
+  n_obs_steps: 1
+  image_size: 420
+  patch_size: 14
+  hidden_dim: 128
+  vit_depth: 8
+  vit_heads: 8
+  vit_mlp_dim: 256
+  arp_depth: 4
+  dropout: 0.1
+  scene_bounds: [0.15, -0.40, -0.15, 0.75, 0.30, 0.50]
+  num_latents: 1
+
+optimizer:
+  # Original real-robot ARP: base 5e-5 multiplied by effective batch 16.
+  lr: 0.0008
+  betas: [0.9, 0.999]
+  transformer_weight_decay: 0.0001
+
+training:
+  device: cuda:0
+  seed: 42
+  debug: false
+  resume: false
+  resume_optimizer: true
+  resume_path: null
+  use_ema: false
+  lr_scheduler: cosine
+  lr_num_cycles: 1
+  lr_warmup_steps: 1000
+  gradient_accumulate_every: 8
+  # 40 training episodes and effective batch 16 give about 50k updates.
+  num_epochs: 266
+  stop_at_epoch: 266
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+  val_every: 5
+  sample_every: 1000
+  checkpoint_every: 5
+
+logging:
+  project: adaptive_chunk
+  entity: huiyuan_tac
+  group: threading_real_mvt_arp
+  id: null
+  mode: offline
+  name: threading_new_1_mvt_arp
+  tags: [threading_real, mvt, vit, arp, two_view, 420px, sg5, nozero]
+
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.3f}.ckpt'
+    k: 3
+    mode: min
+    monitor_key: val_loss

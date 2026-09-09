@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Two-card DDP configuration for the combined two-view threading dataset.
+# Multi-GPU DDP configuration for the combined two-view threading dataset.
 # Override variables on the command line, e.g. STEPS=10 ./train_full.sh.
 PI05_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 if [[ -d "${PI05_DIR}/../../data/threading_combined_pi05_15hz_sg5_nozero" ]]; then
@@ -11,22 +11,36 @@ else
 fi
 DATASET_ROOT=${DATASET_ROOT:-${PROJECT_ROOT}/data/threading_combined_pi05_15hz_sg5_nozero}
 REPO_ID=${REPO_ID:-threading_real/threading_combined_pi05_15hz_sg5_nozero}
-OUTPUT_DIR=${OUTPUT_DIR:-${PI05_DIR}/outputs/threading_combined_pi05}
+OUTPUT_DIR=${OUTPUT_DIR:-${PI05_DIR}/outputs/threading_combined_pi05_conditioned_v7_visual_expert_no_gripper}
 MODEL_ID=${MODEL_ID:-lerobot/pi05_base}
 BATCH_SIZE=${BATCH_SIZE:-1}
 NUM_WORKERS=${NUM_WORKERS:-4}
-STEPS=${STEPS:-15000}
-# The training server has limited disk space. Keep three checkpoints while
-# giving the 11,390-frame training split about 2.63 effective passes.
-SAVE_FREQ=${SAVE_FREQ:-5000}
-EVAL_FREQ=${EVAL_FREQ:-500}
+GRADIENT_ACCUMULATION=${GRADIENT_ACCUMULATION:-2}
+# With six data-parallel workers, 20k microsteps consume 120k samples: about
+# 10.5 passes over the current 11,390-frame training split. Gradient
+# accumulation changes optimizer batch size, not the number of samples seen.
+STEPS=${STEPS:-20000}
+# Full conditional-backbone fine-tuning has larger optimizer checkpoints. Keep
+# one midpoint checkpoint plus the final checkpoint on the space-limited host.
+SAVE_FREQ=${SAVE_FREQ:-10000}
+EVAL_FREQ=${EVAL_FREQ:-1000}
 MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES:-512}
 EVAL_SPLIT=${EVAL_SPLIT:-0.2}
-TRAIN_EXPERT_ONLY=${TRAIN_EXPERT_ONLY:-true}
+FREEZE_VISION_ENCODER=${FREEZE_VISION_ENCODER:-false}
+TRAIN_EXPERT_ONLY=${TRAIN_EXPERT_ONLY:-false}
+PROPRIOCEPTION_DROPOUT=${PROPRIOCEPTION_DROPOUT:-0.0}
+IGNORE_GRIPPER_ACTION=${IGNORE_GRIPPER_ACTION:-true}
+FINETUNE_MODE=${FINETUNE_MODE:-visual_expert}
+VISION_LR_SCALE=${VISION_LR_SCALE:-0.1}
+NORMALIZATION_MAPPING=${NORMALIZATION_MAPPING:-'{"VISUAL":"IDENTITY","STATE":"QUANTILES","ACTION":"QUANTILES"}'}
+LOG_FREQ=${LOG_FREQ:-20}
+SCHEDULER_WARMUP_STEPS=${SCHEDULER_WARMUP_STEPS:-1000}
+SCHEDULER_DECAY_STEPS=${SCHEDULER_DECAY_STEPS:-20000}
 WANDB_ENABLE=${WANDB_ENABLE:-true}
 WANDB_PROJECT=${WANDB_PROJECT:-threading_pi05}
-GPU_IDS=${GPU_IDS:-4,5}
-NUM_PROCESSES=${NUM_PROCESSES:-2}
+JOB_NAME=${JOB_NAME:-threading_combined_pi05_conditioned_v7_visual_expert_no_gripper}
+GPU_IDS=${GPU_IDS:-0,1,3,4,5,6}
+NUM_PROCESSES=${NUM_PROCESSES:-6}
 
 # Keep the only copy of downloaded base weights and W&B files inside this
 # project. uv is invoked with --no-cache by bootstrap_remote.sh.
@@ -34,10 +48,6 @@ export HF_HOME=${HF_HOME:-${PROJECT_ROOT}/.cache/huggingface}
 export WANDB_DIR=${WANDB_DIR:-${PROJECT_ROOT}/.cache/wandb}
 mkdir -p "${HF_HOME}" "${WANDB_DIR}"
 
-if [[ -z "${HF_TOKEN:-}" ]]; then
-  echo "HF_TOKEN is not set." >&2
-  exit 2
-fi
 if ! python - <<'PY'
 from huggingface_hub import hf_hub_download
 
@@ -48,21 +58,90 @@ hf_hub_download(
 print("Hugging Face access check passed: google/paligemma-3b-pt-224")
 PY
 then
-  echo "HF_TOKEN is invalid or its account lacks access to google/paligemma-3b-pt-224." >&2
+  echo "PaliGemma access failed; log in with huggingface-cli or set an authorized HF_TOKEN." >&2
   exit 2
 fi
 
-if [[ "${NUM_PROCESSES}" != "2" ]]; then
-  echo "This profile is sized for exactly two A40 GPUs; got NUM_PROCESSES=${NUM_PROCESSES}." >&2
+for integer_setting in \
+  BATCH_SIZE NUM_WORKERS GRADIENT_ACCUMULATION STEPS SAVE_FREQ EVAL_FREQ \
+  MAX_EVAL_SAMPLES LOG_FREQ SCHEDULER_WARMUP_STEPS SCHEDULER_DECAY_STEPS; do
+  value=${!integer_setting}
+  if [[ ! "${value}" =~ ^[0-9]+$ ]] || ((value < 1)); then
+    echo "${integer_setting} must be a positive integer; got ${value}." >&2
+    exit 2
+  fi
+done
+if [[ "${TRAIN_EXPERT_ONLY}" == "true" && "${FREEZE_VISION_ENCODER}" != "true" ]]; then
+  echo "TRAIN_EXPERT_ONLY=true already freezes the vision encoder; set FREEZE_VISION_ENCODER=true for an unambiguous run config." >&2
   exit 2
 fi
-IFS=',' read -r GPU_A GPU_B GPU_EXTRA <<<"${GPU_IDS}"
-if [[ -z "${GPU_A}" || -z "${GPU_B}" || -n "${GPU_EXTRA}" || "${GPU_A}" == "${GPU_B}" ]]; then
-  echo "GPU_IDS must contain two physical GPU indices, e.g. GPU_IDS=4,5." >&2
+if [[ "${FINETUNE_MODE}" != "default" && "${FINETUNE_MODE}" != "visual_expert" ]]; then
+  echo "FINETUNE_MODE must be default or visual_expert; got ${FINETUNE_MODE}." >&2
   exit 2
 fi
+if [[ "${FINETUNE_MODE}" == "visual_expert" ]] && \
+   [[ "${FREEZE_VISION_ENCODER}" != "false" || "${TRAIN_EXPERT_ONLY}" != "false" ]]; then
+  echo "visual_expert mode requires both base freeze flags to be false." >&2
+  exit 2
+fi
+python - "${VISION_LR_SCALE}" <<'PY'
+import sys
+
+scale = float(sys.argv[1])
+if not 0.0 < scale <= 1.0:
+    raise SystemExit("VISION_LR_SCALE must be in (0, 1]")
+PY
+python - "${PROPRIOCEPTION_DROPOUT}" <<'PY'
+import sys
+
+probability = float(sys.argv[1])
+if not 0.0 <= probability < 1.0:
+    raise SystemExit("PROPRIOCEPTION_DROPOUT must be in [0, 1)")
+PY
+if [[ "${IGNORE_GRIPPER_ACTION}" != "true" && "${IGNORE_GRIPPER_ACTION}" != "false" ]]; then
+  echo "IGNORE_GRIPPER_ACTION must be true or false; got ${IGNORE_GRIPPER_ACTION}." >&2
+  exit 2
+fi
+GRIPPER_TARGET_NORMALIZED=0.0
+if [[ "${IGNORE_GRIPPER_ACTION}" == "true" ]]; then
+  GRIPPER_TARGET_NORMALIZED=$(python - "${DATASET_ROOT}" "${NORMALIZATION_MAPPING}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+mode = json.loads(sys.argv[2])["ACTION"]
+stats = json.loads((root / "meta" / "stats.json").read_text())["action"]
+index = 6
+if mode == "QUANTILES":
+    low, high = stats["q01"][index], stats["q99"][index]
+    value = 2.0 * (0.0 - low) / (high - low) - 1.0
+elif mode == "MIN_MAX":
+    low, high = stats["min"][index], stats["max"][index]
+    value = 2.0 * (0.0 - low) / (high - low) - 1.0
+elif mode == "MEAN_STD":
+    value = (0.0 - stats["mean"][index]) / stats["std"][index]
+else:
+    raise SystemExit(f"Unsupported ACTION normalization for gripper no-op: {mode}")
+print(value)
+PY
+  )
+fi
+IFS=',' read -r -a GPU_ARRAY <<<"${GPU_IDS}"
+if ((${#GPU_ARRAY[@]} != NUM_PROCESSES)); then
+  echo "GPU_IDS contains ${#GPU_ARRAY[@]} devices but NUM_PROCESSES=${NUM_PROCESSES}." >&2
+  exit 2
+fi
+declare -A SEEN_GPUS=()
+for gpu_id in "${GPU_ARRAY[@]}"; do
+  if [[ ! "${gpu_id}" =~ ^[0-9]+$ ]] || [[ -n "${SEEN_GPUS[${gpu_id}]:-}" ]]; then
+    echo "GPU_IDS must contain unique non-negative integer device IDs; got ${GPU_IDS}." >&2
+    exit 2
+  fi
+  SEEN_GPUS[${gpu_id}]=1
+done
 if command -v nvidia-smi >/dev/null 2>&1; then
-  for gpu_id in "${GPU_A}" "${GPU_B}"; do
+  for gpu_id in "${GPU_ARRAY[@]}"; do
     free_mib=$(nvidia-smi --id="${gpu_id}" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d ' ')
     if [[ ! "${free_mib}" =~ ^[0-9]+$ ]]; then
       echo "Could not read free memory for GPU ${gpu_id}." >&2
@@ -90,6 +169,40 @@ python "${PI05_DIR}/preflight.py" \
   --repo-id "${REPO_ID}" \
   --chunk-size 10
 
+python - "${DATASET_ROOT}" "${EVAL_SPLIT}" "${BATCH_SIZE}" \
+  "${NUM_PROCESSES}" "${GRADIENT_ACCUMULATION}" "${STEPS}" <<'PY'
+import json
+import math
+import sys
+from pathlib import Path
+
+dataset_root, eval_split, batch_size, workers, accumulation, steps = sys.argv[1:]
+info = json.loads((Path(dataset_root) / "meta" / "info.json").read_text())
+report = json.loads(
+    (Path(dataset_root) / "meta" / "pi05_preparation_report.json").read_text()
+)
+
+# LeRobot holds out the last ceil(N * eval_split) episodes for this one-task dataset.
+episodes = info["total_episodes"]
+held_out = math.ceil(episodes * float(eval_split))
+rows = [int(length) for length in report["episode_lengths"]]
+if len(rows) != episodes:
+    raise SystemExit(
+        f"preparation report has {len(rows)} episode lengths, expected {episodes}"
+    )
+train_frames = sum(rows[: episodes - held_out])
+samples_per_microstep = int(batch_size) * int(workers)
+optimizer_updates = math.ceil(int(steps) / int(accumulation))
+passes = int(steps) * samples_per_microstep / train_frames
+print(json.dumps({
+    "train_frames": train_frames,
+    "samples_per_microstep": samples_per_microstep,
+    "effective_optimizer_batch": samples_per_microstep * int(accumulation),
+    "optimizer_updates": optimizer_updates,
+    "projected_train_passes": passes,
+}, indent=2))
+PY
+
 if [[ -e "${OUTPUT_DIR}" ]]; then
   echo "Refusing to overwrite existing output: ${OUTPUT_DIR}" >&2
   echo "Set OUTPUT_DIR to a new directory, or use the documented resume command." >&2
@@ -98,8 +211,14 @@ fi
 
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+export PI05_PROPRIO_DROPOUT="${PROPRIOCEPTION_DROPOUT}"
+export PI05_IGNORE_GRIPPER_ACTION="${IGNORE_GRIPPER_ACTION}"
+export PI05_GRIPPER_TARGET_NORMALIZED="${GRIPPER_TARGET_NORMALIZED}"
+export PI05_FINETUNE_MODE="${FINETUNE_MODE}"
+export PI05_VISION_LR_SCALE="${VISION_LR_SCALE}"
 
-exec torchrun --standalone --nproc-per-node="${NUM_PROCESSES}" "$(command -v lerobot-train)" \
+exec torchrun --standalone --nproc-per-node="${NUM_PROCESSES}" \
+  "${PI05_DIR}/train_with_state_dropout.py" \
   --dataset.repo_id="${REPO_ID}" \
   --dataset.root="${DATASET_ROOT}" \
   --dataset.video_backend=pyav \
@@ -108,8 +227,11 @@ exec torchrun --standalone --nproc-per-node="${NUM_PROCESSES}" "$(command -v ler
   --policy.pretrained_path="${MODEL_ID}" \
   --policy.chunk_size=10 \
   --policy.n_action_steps=10 \
-  --policy.freeze_vision_encoder=false \
+  --policy.normalization_mapping="${NORMALIZATION_MAPPING}" \
+  --policy.freeze_vision_encoder="${FREEZE_VISION_ENCODER}" \
   --policy.train_expert_only="${TRAIN_EXPERT_ONLY}" \
+  --policy.scheduler_warmup_steps="${SCHEDULER_WARMUP_STEPS}" \
+  --policy.scheduler_decay_steps="${SCHEDULER_DECAY_STEPS}" \
   --policy.gradient_checkpointing=true \
   --policy.compile_model=false \
   --policy.dtype=bfloat16 \
@@ -117,13 +239,14 @@ exec torchrun --standalone --nproc-per-node="${NUM_PROCESSES}" "$(command -v ler
   --policy.push_to_hub=false \
   --parallelism.dp_replicate="${NUM_PROCESSES}" \
   --accelerator.mixed_precision=bf16 \
+  --accelerator.gradient_accumulation.steps="${GRADIENT_ACCUMULATION}" \
   --checkpoint_format=safetensors \
   --output_dir="${OUTPUT_DIR}" \
-  --job_name=threading_combined_pi05 \
+  --job_name="${JOB_NAME}" \
   --batch_size="${BATCH_SIZE}" \
   --num_workers="${NUM_WORKERS}" \
   --steps="${STEPS}" \
-  --log_freq=10 \
+  --log_freq="${LOG_FREQ}" \
   --eval_steps="${EVAL_FREQ}" \
   --max_eval_samples="${MAX_EVAL_SAMPLES}" \
   --save_freq="${SAVE_FREQ}" \

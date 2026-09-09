@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from threading_task.tcp_chunk_labels import label_tcp_motion, smooth_chunk_labels, tcp_motion_metrics
+from threading_task.tcp_chunk_labels import (
+    label_tcp_motion,
+    smooth_chunk_labels,
+    smooth_chunk_probabilities,
+    soft_chunk_targets,
+    tcp_motion_metrics,
+)
 
 
 def test_tcp_motion_metrics_use_cartesian_action_units() -> None:
@@ -48,3 +54,27 @@ def test_chunk_median_smoothing_removes_a_single_frame_spike() -> None:
         np.array([1, 1, 20, 1, 1]), candidate_chunks=(1, 2, 4, 8, 20), window=3
     )
     assert np.array_equal(result, np.array([1, 1, 1, 1, 1]))
+
+
+def test_soft_chunk_targets_span_endpoints_and_preserve_expectation() -> None:
+    probabilities, expected = soft_chunk_targets(
+        np.array([0.0, 0.5, 1.0]),
+        candidate_chunks=(4, 10),
+    )
+
+    np.testing.assert_allclose(probabilities.sum(axis=1), 1.0)
+    np.testing.assert_allclose(probabilities[0], [0.0, 1.0])
+    np.testing.assert_allclose(probabilities[1], [0.5, 0.5])
+    np.testing.assert_allclose(probabilities[2], [1.0, 0.0])
+    np.testing.assert_allclose(expected, [10.0, 7.0, 4.0])
+
+
+def test_soft_probability_smoothing_removes_a_single_frame_spike() -> None:
+    probabilities = np.asarray(
+        [[0.9, 0.1], [0.9, 0.1], [0.1, 0.9], [0.9, 0.1], [0.9, 0.1]]
+    )
+
+    result = smooth_chunk_probabilities(probabilities, window=3)
+
+    np.testing.assert_allclose(result.sum(axis=1), 1.0)
+    np.testing.assert_allclose(result[:, 0], 0.9)

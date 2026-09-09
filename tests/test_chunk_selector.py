@@ -52,6 +52,22 @@ def test_selector_maps_classes_to_execution_chunks():
     assert not result.used_safe_fallback.any()
 
 
+def test_selector_expected_mode_outputs_continuous_and_rounded_chunks():
+    selector = ChunkSelector(
+        _selector_config(candidate_chunks=(4, 10), selection_mode="expected")
+    ).eval()
+    with torch.no_grad():
+        selector.head[-1].weight.zero_()
+        selector.head[-1].bias.copy_(torch.log(torch.tensor([0.25, 0.75])))
+    maps = [torch.randn(1, 16, 3, 3), torch.randn(1, 16, 3, 3)]
+    tokens, camera_ids, spatial_ids = flatten_camera_feature_maps(maps)
+
+    result = selector.select(tokens, camera_ids=camera_ids, spatial_ids=spatial_ids)
+
+    assert result.continuous_chunk_sizes.item() == pytest.approx(8.5)
+    assert result.chunk_sizes.item() == 9
+
+
 def test_selector_uses_configured_low_confidence_fallback():
     config = _selector_config(
         confidence_threshold=0.9,

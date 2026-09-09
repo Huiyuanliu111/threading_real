@@ -21,7 +21,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from convert_lerobot_v3_to_cartesian import UrdfForwardKinematics
-from threading_task.tcp_chunk_labels import LABEL_RULE_VERSION, label_tcp_motion, smooth_chunk_labels, tcp_motion_metrics
+from threading_task.tcp_chunk_labels import (
+    LABEL_RULE_VERSION,
+    label_tcp_motion,
+    smooth_chunk_labels,
+    smooth_chunk_probabilities,
+    soft_chunk_targets,
+    tcp_motion_metrics,
+)
 
 
 def _read_vectors(table: pa.Table, name: str) -> np.ndarray:
@@ -103,6 +110,10 @@ def create_labels(
     raw_chunks, precision_score = label_tcp_motion(
         metric_columns, candidate_chunks=candidate_chunks
     )
+    target_probabilities, _ = soft_chunk_targets(
+        precision_score,
+        candidate_chunks=candidate_chunks,
+    )
     chunks = raw_chunks.copy()
     raw_transitions = 0
     smoothed_transitions = 0
@@ -113,8 +124,13 @@ def create_labels(
             raw_chunks[rows], candidate_chunks=candidate_chunks,
             window=label_smoothing_window,
         )
+        target_probabilities[rows] = smooth_chunk_probabilities(
+            target_probabilities[rows],
+            window=label_smoothing_window,
+        )
         raw_transitions += int(np.count_nonzero(np.diff(raw_chunks[rows])))
         smoothed_transitions += int(np.count_nonzero(np.diff(chunks[rows])))
+    soft_chunk_size = target_probabilities @ np.asarray(candidate_chunks, dtype=np.float32)
     output.mkdir(parents=True)
     labels = pa.table(
         {
@@ -123,6 +139,11 @@ def create_labels(
             "index": pa.array(global_indices),
             "chunk_size": pa.array(chunks),
             "precision_score": pa.array(precision_score),
+            "soft_chunk_size": pa.array(soft_chunk_size),
+            **{
+                f"chunk_probability_{chunk}": pa.array(target_probabilities[:, class_id])
+                for class_id, chunk in enumerate(candidate_chunks)
+            },
             "tcp_x_m": pa.array(tcp_positions[:, 0]),
             "tcp_y_m": pa.array(tcp_positions[:, 1]),
             "tcp_z_m": pa.array(tcp_positions[:, 2]),
@@ -166,6 +187,17 @@ def create_labels(
         "direction_speed_floor_mps": direction_speed_floor_mps,
         "score": "0.70*slow_linear + 0.10*slow_angular + 0.20*max(curvature, acceleration, gripper_speed) percentiles",
         "label_mapping": "higher precision-score percentile maps to a shorter chunk",
+        "soft_label_mapping": (
+            "linear interpolation between neighboring candidate chunks by global "
+            "precision-score rank"
+        ),
+        "soft_chunk_size": {
+            "min": float(soft_chunk_size.min()),
+            "p25": float(np.quantile(soft_chunk_size, 0.25)),
+            "median": float(np.median(soft_chunk_size)),
+            "p75": float(np.quantile(soft_chunk_size, 0.75)),
+            "max": float(soft_chunk_size.max()),
+        },
         "total_frames": int(len(labels)),
         "chunk_counts": {str(chunk): chunk_counts.get(chunk, 0) for chunk in candidate_chunks},
         "episodes": episode_summary,

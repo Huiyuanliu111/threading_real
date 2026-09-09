@@ -188,6 +188,14 @@ class ChunkFeatureWriter:
             fillvalue=np.nan,
         )
         self.h5.create_dataset(
+            "target_probabilities",
+            shape=(0, len(candidates)),
+            maxshape=(None, len(candidates)),
+            chunks=(64, len(candidates)),
+            dtype="f4",
+            fillvalue=np.nan,
+        )
+        self.h5.create_dataset(
             "sample_weights",
             shape=(0,),
             maxshape=(None,),
@@ -258,6 +266,7 @@ class ChunkFeatureWriter:
         decision_steps: Sequence[int],
         subtasks: Sequence[str] | None = None,
         utilities: torch.Tensor | np.ndarray | None = None,
+        target_probabilities: torch.Tensor | np.ndarray | None = None,
         sample_weights: Sequence[float] | torch.Tensor | np.ndarray | None = None,
         camera_ids: torch.Tensor | np.ndarray | None = None,
         time_ids: torch.Tensor | np.ndarray | None = None,
@@ -333,6 +342,36 @@ class ChunkFeatureWriter:
                     f"{(batch_size, len(self.candidate_chunks))}, got {utility_array.shape}"
                 )
 
+        if target_probabilities is None:
+            target_probability_array = np.full(
+                (batch_size, len(self.candidate_chunks)),
+                np.nan,
+                dtype=np.float32,
+            )
+        else:
+            target_probability_array = np.asarray(
+                target_probabilities.detach().cpu().numpy()
+                if isinstance(target_probabilities, torch.Tensor)
+                else target_probabilities,
+                dtype=np.float32,
+            )
+            if target_probability_array.ndim == 1:
+                target_probability_array = target_probability_array[None]
+            expected_shape = (batch_size, len(self.candidate_chunks))
+            if target_probability_array.shape != expected_shape:
+                raise ValueError(
+                    f"target_probabilities must have shape {expected_shape}, "
+                    f"got {target_probability_array.shape}"
+                )
+            if (
+                not np.isfinite(target_probability_array).all()
+                or np.any(target_probability_array < 0.0)
+                or not np.allclose(target_probability_array.sum(axis=1), 1.0, atol=1e-5)
+            ):
+                raise ValueError(
+                    "target_probabilities must be finite, non-negative, and sum to one"
+                )
+
         old_size = len(self.h5["labels"])
         new_size = old_size + batch_size
         for dataset in self.h5.values():
@@ -340,6 +379,7 @@ class ChunkFeatureWriter:
         self.h5["features"][old_size:new_size] = feature_array
         self.h5["labels"][old_size:new_size] = label_array
         self.h5["utilities"][old_size:new_size] = utility_array
+        self.h5["target_probabilities"][old_size:new_size] = target_probability_array
         self.h5["sample_weights"][old_size:new_size] = sample_weight_array
         self.h5["camera_ids"][old_size:new_size] = self._ids_array(
             camera_ids, batch_size=batch_size
@@ -416,6 +456,14 @@ class ChunkFeatureDataset(Dataset):
     def __getitem__(self, item: int) -> dict[str, Any]:
         index = int(self.indices[item])
         utilities = torch.from_numpy(np.asarray(self.h5["utilities"][index])).float()
+        if "target_probabilities" in self.h5:
+            target_probabilities = torch.from_numpy(
+                np.asarray(self.h5["target_probabilities"][index])
+            ).float()
+        else:
+            target_probabilities = torch.full(
+                (len(self.candidate_chunks),), float("nan"), dtype=torch.float32
+            )
         sample_weight = (
             float(self.h5["sample_weights"][index])
             if "sample_weights" in self.h5
@@ -426,6 +474,8 @@ class ChunkFeatureDataset(Dataset):
             "label": torch.as_tensor(int(self.h5["labels"][index]), dtype=torch.long),
             "utilities": utilities,
             "has_utilities": torch.isfinite(utilities).all(),
+            "target_probabilities": target_probabilities,
+            "has_target_probabilities": torch.isfinite(target_probabilities).all(),
             "sample_weight": torch.as_tensor(sample_weight, dtype=torch.float32),
             "camera_ids": torch.from_numpy(
                 np.asarray(self.h5["camera_ids"][index], dtype=np.int64)

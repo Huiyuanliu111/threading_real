@@ -33,6 +33,7 @@ class ChunkSelectorConfig:
     max_spatial_positions: int = 0
     safe_chunk: int | None = None
     confidence_threshold: float | None = None
+    selection_mode: str = "argmax"
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -54,6 +55,8 @@ class ChunkSelectorConfig:
             raise ValueError("safe_chunk must be one of candidate_chunks")
         if self.confidence_threshold is not None and not 0.0 <= self.confidence_threshold <= 1.0:
             raise ValueError("confidence_threshold must lie in [0, 1]")
+        if self.selection_mode not in {"argmax", "expected"}:
+            raise ValueError("selection_mode must be 'argmax' or 'expected'")
         for name in ("num_cameras", "max_time_steps", "max_spatial_positions"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} cannot be negative")
@@ -78,6 +81,7 @@ class ChunkSelection:
     probabilities: torch.Tensor
     class_ids: torch.Tensor
     chunk_sizes: torch.Tensor
+    continuous_chunk_sizes: torch.Tensor
     confidences: torch.Tensor
     used_safe_fallback: torch.Tensor
 
@@ -286,7 +290,12 @@ class ChunkSelector(nn.Module):
             device=logits.device,
             dtype=torch.long,
         )
-        chunk_sizes = candidates[class_ids]
+        continuous_chunk_sizes = probabilities @ candidates.to(dtype=probabilities.dtype)
+        if self.config.selection_mode == "expected":
+            chunk_sizes = torch.floor(continuous_chunk_sizes + 0.5).to(dtype=torch.long)
+            chunk_sizes = chunk_sizes.clamp(int(candidates[0]), int(candidates[-1]))
+        else:
+            chunk_sizes = candidates[class_ids]
 
         threshold = (
             self.config.confidence_threshold
@@ -308,12 +317,18 @@ class ChunkSelector(nn.Module):
                 torch.full_like(chunk_sizes, fallback),
                 chunk_sizes,
             )
+            continuous_chunk_sizes = torch.where(
+                used_safe_fallback,
+                torch.full_like(continuous_chunk_sizes, float(fallback)),
+                continuous_chunk_sizes,
+            )
 
         return ChunkSelection(
             logits=logits,
             probabilities=probabilities,
             class_ids=class_ids,
             chunk_sizes=chunk_sizes,
+            continuous_chunk_sizes=continuous_chunk_sizes,
             confidences=confidences,
             used_safe_fallback=used_safe_fallback,
         )

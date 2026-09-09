@@ -81,7 +81,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--candidate-chunks", type=int, nargs="+", default=[4, 10])
     parser.add_argument("--pool-grid", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()

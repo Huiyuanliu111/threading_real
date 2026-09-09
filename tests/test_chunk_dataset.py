@@ -34,6 +34,15 @@ def test_chunk_feature_dataset_roundtrip_and_episode_split(tmp_path):
                 ],
                 dtype=np.float32,
             ),
+            target_probabilities=np.asarray(
+                [
+                    [0.8, 0.1, 0.1],
+                    [0.1, 0.8, 0.1],
+                    [0.1, 0.1, 0.8],
+                    [0.2, 0.7, 0.1],
+                ],
+                dtype=np.float32,
+            ),
             sample_weights=[1.0, 0.5, 0.25, 1.0],
             episode_ids=["ep0", "ep0", "ep1", "ep1"],
             decision_steps=[0, 1, 0, 1],
@@ -47,6 +56,10 @@ def test_chunk_feature_dataset_roundtrip_and_episode_split(tmp_path):
     assert dataset[2]["features"].shape == (3, 4)
     assert dataset[2]["label"].item() == 2
     assert dataset[2]["has_utilities"].item()
+    assert dataset[2]["has_target_probabilities"].item()
+    torch.testing.assert_close(
+        dataset[2]["target_probabilities"], torch.tensor([0.1, 0.1, 0.8])
+    )
     assert dataset[2]["sample_weight"].item() == pytest.approx(0.25)
     assert dataset[2]["episode_id"] == "ep1"
 

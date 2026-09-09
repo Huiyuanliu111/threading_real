@@ -33,6 +33,28 @@ def smooth_chunk_labels(
     return candidates[median_filter(ranks, size=window, mode="nearest")]
 
 
+def smooth_chunk_probabilities(probabilities: np.ndarray, *, window: int) -> np.ndarray:
+    """Median-filter class probabilities over time and renormalize each row."""
+    values = np.asarray(probabilities, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] < 2:
+        raise ValueError("probabilities must have shape [T, K] with K >= 2")
+    if window <= 0 or window % 2 == 0:
+        raise ValueError("probability smoothing window must be positive and odd")
+    if (
+        not np.isfinite(values).all()
+        or np.any(values < 0.0)
+        or not np.allclose(values.sum(axis=1), 1.0, atol=1e-5)
+    ):
+        raise ValueError("probabilities must be finite, non-negative, and sum to one")
+    if window == 1 or len(values) < 2:
+        return values.astype(np.float32, copy=True)
+    filtered = median_filter(values, size=(window, 1), mode="nearest")
+    row_sums = filtered.sum(axis=1, keepdims=True)
+    if np.any(row_sums <= 0.0):
+        raise ValueError("probability smoothing produced a zero-sum row")
+    return (filtered / row_sums).astype(np.float32)
+
+
 def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
     values = np.asarray(values, dtype=np.float64)
     if values.ndim != 1:
@@ -107,6 +129,45 @@ def empirical_percentile(values: np.ndarray) -> np.ndarray:
     if not np.isfinite(values).all():
         raise ValueError("Metric values must be finite")
     return rankdata(values, method="average") / len(values)
+
+
+def soft_chunk_targets(
+    precision_score: np.ndarray,
+    *,
+    candidate_chunks: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert precision scores into neighboring-class probabilities.
+
+    The lowest observed precision maps to the largest chunk and the highest
+    precision maps to the smallest chunk. Intermediate scores are represented
+    by a linear mixture of the two neighboring candidate chunks. The expected
+    chunk therefore varies continuously across the configured range.
+    """
+    scores = np.asarray(precision_score, dtype=np.float64)
+    candidates = np.asarray(sorted(set(int(v) for v in candidate_chunks)), dtype=np.float64)
+    if scores.ndim != 1 or not len(scores):
+        raise ValueError("precision_score must be a non-empty vector")
+    if not np.isfinite(scores).all():
+        raise ValueError("precision_score must be finite")
+    if len(candidates) < 2 or candidates[0] <= 0:
+        raise ValueError("candidate_chunks must contain at least two positive values")
+
+    ranks = rankdata(scores, method="average")
+    if len(scores) == 1:
+        precision = np.full(1, 0.5, dtype=np.float64)
+    else:
+        precision = (ranks - 1.0) / (len(scores) - 1.0)
+    class_position = (1.0 - precision) * (len(candidates) - 1)
+    lower = np.floor(class_position).astype(np.int64)
+    upper = np.ceil(class_position).astype(np.int64)
+    upper_weight = class_position - lower
+
+    probabilities = np.zeros((len(scores), len(candidates)), dtype=np.float64)
+    rows = np.arange(len(scores))
+    probabilities[rows, lower] += 1.0 - upper_weight
+    probabilities[rows, upper] += upper_weight
+    expected_chunks = probabilities @ candidates
+    return probabilities.astype(np.float32), expected_chunks.astype(np.float32)
 
 
 def label_tcp_motion(
