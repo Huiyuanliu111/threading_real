@@ -3,21 +3,17 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pushbox"
+name = "threading-real"
 version = "0.1.0"
-description = "Custom robosuite environment for box-pushing with Franka Emika Panda"
+description = "Real-robot Threading training and deployment with ARP and pi0.5"
 requires-python = ">=3.10"
 dependencies = [
-    # Simulation
-    "robosuite>=1.5.2",
-    "mujoco>=3.9.0",
     # Numerics
     "numpy>=1.26.4",
     "scipy>=1.15.3",
     # RL / training
     "torch>=2.0.0",
     "torchvision>=0.15.0",
-    "gymnasium>=0.29.0",
     "tensorboard>=2.14.0",
     # Data
     "lerobot>=0.4.0",
@@ -28,7 +24,6 @@ dependencies = [
     "tqdm>=4.67.0",
     "Pillow>=10.0.0",
     "matplotlib>=3.8.0",
-    "pygame>=2.5.0",
 ]
 
 [project.optional-dependencies]
@@ -40,7 +35,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["pushbox*", "envs*", "threading_task*"]
+include = ["pushbox*", "threading_task*", "chunk_selector*", "pi05*"]
 
 [tool.black]
 line-length = 100

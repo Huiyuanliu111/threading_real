@@ -5,7 +5,7 @@ import json
 import pytest
 import torch
 
-from pushbox.chunk_selector import (
+from chunk_selector.chunk_selector import (
     ChunkSelector,
     ChunkSelectorConfig,
     flatten_camera_feature_maps,
