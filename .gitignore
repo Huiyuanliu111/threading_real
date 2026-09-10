@@ -3,5 +3,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 *.log
-outputs/
 *.ckpt
+
+# Local training and diagnostic results.  Keep scripts and calibration in Git;
+# these files are reproducible outputs and may contain large checkpoints.
+/artifacts/
+/data/debug_*/
