@@ -25,8 +25,17 @@ def replace_gripper_with_noop(actions: torch.Tensor, target: float) -> torch.Ten
     return actions
 
 
-def configure_visual_expert_finetuning(policy: PI05Policy, vision_lr_scale: float) -> None:
-    """Freeze language weights and train vision, projection, and action modules."""
+def configure_visual_expert_finetuning(
+    policy: PI05Policy,
+    *,
+    train_expert_mlp: bool,
+    vision_lr: float,
+    projector_lr: float,
+    expert_attention_lr: float,
+    expert_mlp_lr: float,
+    action_lr: float,
+) -> None:
+    """Train the visual path and the selected action-expert submodules."""
     core = policy.model
     for parameter in core.parameters():
         parameter.requires_grad = False
@@ -34,9 +43,7 @@ def configure_visual_expert_finetuning(policy: PI05Policy, vision_lr_scale: floa
     visual = core.paligemma_with_expert.paligemma.model.vision_tower
     projector = core.paligemma_with_expert.paligemma.model.multi_modal_projector
     action_expert = core.paligemma_with_expert.gemma_expert.model
-    full_lr_modules = (
-        projector,
-        action_expert,
+    action_modules = (
         core.action_in_proj,
         core.action_out_proj,
         core.time_mlp_in,
@@ -44,25 +51,71 @@ def configure_visual_expert_finetuning(policy: PI05Policy, vision_lr_scale: floa
     )
     for parameter in visual.parameters():
         parameter.requires_grad = True
-    for module in full_lr_modules:
+    for parameter in projector.parameters():
+        parameter.requires_grad = True
+    for name, parameter in action_expert.named_parameters():
+        # The attention projections are the route by which action tokens read
+        # the visual/language prefix. The full-expert mode also adapts MLPs and
+        # expert-specific normalization parameters.
+        if ".self_attn." in name:
+            parameter.requires_grad = True
+        if train_expert_mlp:
+            parameter.requires_grad = True
+    for module in action_modules:
         for parameter in module.parameters():
             parameter.requires_grad = True
 
-    visual_ids = {id(parameter) for parameter in visual.parameters()}
-    visual_parameters = [parameter for parameter in core.parameters() if id(parameter) in visual_ids]
-    other_parameters = [
+    def parameters_of(module: torch.nn.Module) -> list[torch.nn.Parameter]:
+        return [parameter for parameter in module.parameters() if parameter.requires_grad]
+
+    attention_parameters = [
         parameter
-        for parameter in core.parameters()
-        if parameter.requires_grad and id(parameter) not in visual_ids
+        for name, parameter in action_expert.named_parameters()
+        if parameter.requires_grad and ".self_attn." in name
+    ]
+    mlp_parameters = [
+        parameter
+        for name, parameter in action_expert.named_parameters()
+        if parameter.requires_grad and ".mlp." in name
+    ]
+    other_expert_parameters = [
+        parameter
+        for name, parameter in action_expert.named_parameters()
+        if parameter.requires_grad and ".self_attn." not in name and ".mlp." not in name
+    ]
+    action_parameters = [
+        parameter
+        for module in action_modules
+        for parameter in module.parameters()
+        if parameter.requires_grad
     ]
     policy._pi05_optimizer_groups = [
-        {"params": other_parameters, "name": "action_and_projector"},
-        {
-            "params": visual_parameters,
-            "lr": policy.config.optimizer_lr * vision_lr_scale,
-            "name": "vision",
-        },
+        {"params": action_parameters, "lr": action_lr, "name": "action_projections"},
+        {"params": parameters_of(projector), "lr": projector_lr, "name": "multimodal_projector"},
+        {"params": attention_parameters, "lr": expert_attention_lr, "name": "expert_attention"},
     ]
+    if train_expert_mlp:
+        if not mlp_parameters:
+            raise RuntimeError("visual_full_expert selected, but no expert MLP parameters were found")
+        policy._pi05_optimizer_groups.append(
+            {"params": mlp_parameters, "lr": expert_mlp_lr, "name": "expert_mlp"}
+        )
+        if other_expert_parameters:
+            policy._pi05_optimizer_groups.append(
+                {"params": other_expert_parameters, "lr": expert_mlp_lr, "name": "expert_norms"}
+            )
+    policy._pi05_optimizer_groups.append(
+        {"params": parameters_of(visual), "lr": vision_lr, "name": "vision"}
+    )
+
+    grouped_ids = {
+        id(parameter)
+        for group in policy._pi05_optimizer_groups
+        for parameter in group["params"]
+    }
+    trainable_ids = {id(parameter) for parameter in core.parameters() if parameter.requires_grad}
+    if grouped_ids != trainable_ids:
+        raise RuntimeError("optimizer groups do not exactly cover the trainable PI05 parameters")
 
 
 def selective_optim_params(policy: PI05Policy):
@@ -115,27 +168,83 @@ def main() -> None:
     ignore_gripper = os.environ.get("PI05_IGNORE_GRIPPER_ACTION", "false").lower() == "true"
     gripper_target = float(os.environ.get("PI05_GRIPPER_TARGET_NORMALIZED", "0"))
     finetune_mode = os.environ.get("PI05_FINETUNE_MODE", "default")
-    vision_lr_scale = float(os.environ.get("PI05_VISION_LR_SCALE", "0.1"))
-    if finetune_mode not in {"default", "visual_expert"}:
+    vision_lr = float(os.environ.get("PI05_VISION_LR", "2.5e-6"))
+    projector_lr = float(os.environ.get("PI05_PROJECTOR_LR", "1e-5"))
+    expert_attention_lr = float(os.environ.get("PI05_EXPERT_ATTENTION_LR", "5e-6"))
+    expert_mlp_lr = float(os.environ.get("PI05_EXPERT_MLP_LR", "2.5e-6"))
+    action_lr = float(os.environ.get("PI05_ACTION_LR", "1e-5"))
+    high_noise_fraction = float(os.environ.get("PI05_HIGH_NOISE_FRACTION", "0"))
+    high_noise_min_time = float(os.environ.get("PI05_HIGH_NOISE_MIN_TIME", "0.8"))
+    fixed_eval_seed = int(os.environ.get("PI05_FIXED_EVAL_SEED", "0"))
+    if finetune_mode not in {"default", "visual_expert", "visual_full_expert"}:
         raise ValueError(f"unknown PI05_FINETUNE_MODE: {finetune_mode}")
-    if not 0.0 < vision_lr_scale <= 1.0:
-        raise ValueError("PI05_VISION_LR_SCALE must be in (0, 1]")
+    for name, value in {
+        "PI05_VISION_LR": vision_lr,
+        "PI05_PROJECTOR_LR": projector_lr,
+        "PI05_EXPERT_ATTENTION_LR": expert_attention_lr,
+        "PI05_EXPERT_MLP_LR": expert_mlp_lr,
+        "PI05_ACTION_LR": action_lr,
+    }.items():
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+    if not 0.0 <= high_noise_fraction <= 1.0:
+        raise ValueError("PI05_HIGH_NOISE_FRACTION must be in [0, 1]")
+    if not 0.0 <= high_noise_min_time < 1.0:
+        raise ValueError("PI05_HIGH_NOISE_MIN_TIME must be in [0, 1)")
 
     original_forward = PI05Pytorch.forward
+    original_sample_time = PI05Pytorch.sample_time
+    original_policy_forward = PI05Policy.forward
     original_policy_init = PI05Policy.__init__
 
     def policy_init_with_finetuning(self, *args, **kwargs):
         original_policy_init(self, *args, **kwargs)
-        if finetune_mode == "visual_expert":
-            configure_visual_expert_finetuning(self, vision_lr_scale)
+        if finetune_mode in {"visual_expert", "visual_full_expert"}:
+            configure_visual_expert_finetuning(
+                self,
+                train_expert_mlp=finetune_mode == "visual_full_expert",
+                vision_lr=vision_lr,
+                projector_lr=projector_lr,
+                expert_attention_lr=expert_attention_lr,
+                expert_mlp_lr=expert_mlp_lr,
+                action_lr=action_lr,
+            )
             trainable = sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
             total = sum(parameter.numel() for parameter in self.parameters())
+            group_report = ", ".join(
+                f"{group['name']}={sum(parameter.numel() for parameter in group['params'])}@{group['lr']:.2g}"
+                for group in self._pi05_optimizer_groups
+            )
             print(
-                "Selective finetuning: vision tower at "
-                f"{vision_lr_scale:g}x LR; multimodal projector and action expert at full LR; "
-                f"PaliGemma language backbone frozen; trainable={trainable}/{total}",
+                "Selective finetuning: PaliGemma language frozen; "
+                f"{group_report}; trainable={trainable}/{total}",
                 flush=True,
             )
+
+    def sample_time_with_high_noise_mixture(self, bsize, device):
+        time = original_sample_time(self, bsize, device)
+        if high_noise_fraction <= 0:
+            return time
+        selected = torch.rand(bsize, device=device) < high_noise_fraction
+        high_time = high_noise_min_time + (1.0 - high_noise_min_time) * torch.rand(
+            bsize, device=device
+        )
+        return torch.where(selected, high_time, time)
+
+    def policy_forward_with_fixed_eval(self, batch, reduction="mean"):
+        if self.training or fixed_eval_seed <= 0:
+            return original_policy_forward(self, batch, reduction=reduction)
+        indices = batch.get("index")
+        batch_seed = fixed_eval_seed
+        if isinstance(indices, torch.Tensor):
+            batch_seed += int(indices.detach().to(dtype=torch.int64).sum().cpu().item())
+        action = batch.get("action")
+        cuda_devices = []
+        if isinstance(action, torch.Tensor) and action.is_cuda:
+            cuda_devices = [action.device.index]
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(batch_seed)
+            return original_policy_forward(self, batch, reduction=reduction)
 
     def forward_with_state_dropout(
         self,
@@ -174,7 +283,9 @@ def main() -> None:
 
     PI05Policy.__init__ = policy_init_with_finetuning
     PI05Policy.get_optim_params = selective_optim_params
+    PI05Policy.forward = policy_forward_with_fixed_eval
     PI05Pytorch.forward = forward_with_state_dropout
+    PI05Pytorch.sample_time = sample_time_with_high_noise_mixture
     if probability > 0:
         print(f"Enabled training-only pi0.5 state-prompt dropout: p={probability}", flush=True)
     else:
@@ -185,6 +296,14 @@ def main() -> None:
             f"normalized no-op target={gripper_target:.9g}",
             flush=True,
         )
+    if high_noise_fraction > 0:
+        print(
+            f"High-noise timestep mixture: fraction={high_noise_fraction:g}, "
+            f"uniform_range=[{high_noise_min_time:g}, 1]",
+            flush=True,
+        )
+    if fixed_eval_seed > 0:
+        print(f"Deterministic evaluation RNG enabled: seed={fixed_eval_seed}", flush=True)
     runpy.run_module("lerobot.scripts.lerobot_train", run_name="__main__")
 
 

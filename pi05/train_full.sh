@@ -11,34 +11,38 @@ else
 fi
 DATASET_ROOT=${DATASET_ROOT:-${PROJECT_ROOT}/data/threading_combined_pi05_15hz_sg5_nozero}
 REPO_ID=${REPO_ID:-threading_real/threading_combined_pi05_15hz_sg5_nozero}
-OUTPUT_DIR=${OUTPUT_DIR:-${PI05_DIR}/outputs/threading_combined_pi05_conditioned_v7_visual_expert_no_gripper}
+OUTPUT_DIR=${OUTPUT_DIR:-${PI05_DIR}/outputs/threading_combined_pi05_conditioned_v9_full_expert}
 MODEL_ID=${MODEL_ID:-lerobot/pi05_base}
-BATCH_SIZE=${BATCH_SIZE:-1}
+BATCH_SIZE=${BATCH_SIZE:-2}
 NUM_WORKERS=${NUM_WORKERS:-4}
-GRADIENT_ACCUMULATION=${GRADIENT_ACCUMULATION:-2}
-# With six data-parallel workers, 20k microsteps consume 120k samples: about
-# 10.5 passes over the current 11,390-frame training split. Gradient
-# accumulation changes optimizer batch size, not the number of samples seen.
-STEPS=${STEPS:-20000}
-# Full conditional-backbone fine-tuning has larger optimizer checkpoints. Keep
-# one midpoint checkpoint plus the final checkpoint on the space-limited host.
-SAVE_FREQ=${SAVE_FREQ:-10000}
-EVAL_FREQ=${EVAL_FREQ:-1000}
+GRADIENT_ACCUMULATION=${GRADIENT_ACCUMULATION:-1}
+# Full expert run. With six workers and per-rank batch two, every loop step is
+# one optimizer update with effective batch 12.
+STEPS=${STEPS:-5000}
+SAVE_FREQ=${SAVE_FREQ:-1000}
+EVAL_FREQ=${EVAL_FREQ:-500}
 MAX_EVAL_SAMPLES=${MAX_EVAL_SAMPLES:-512}
 EVAL_SPLIT=${EVAL_SPLIT:-0.2}
 FREEZE_VISION_ENCODER=${FREEZE_VISION_ENCODER:-false}
 TRAIN_EXPERT_ONLY=${TRAIN_EXPERT_ONLY:-false}
-PROPRIOCEPTION_DROPOUT=${PROPRIOCEPTION_DROPOUT:-0.0}
+PROPRIOCEPTION_DROPOUT=${PROPRIOCEPTION_DROPOUT:-0.15}
 IGNORE_GRIPPER_ACTION=${IGNORE_GRIPPER_ACTION:-true}
-FINETUNE_MODE=${FINETUNE_MODE:-visual_expert}
-VISION_LR_SCALE=${VISION_LR_SCALE:-0.1}
+FINETUNE_MODE=${FINETUNE_MODE:-visual_full_expert}
+VISION_LR=${VISION_LR:-2.5e-6}
+PROJECTOR_LR=${PROJECTOR_LR:-1e-5}
+EXPERT_ATTENTION_LR=${EXPERT_ATTENTION_LR:-5e-6}
+EXPERT_MLP_LR=${EXPERT_MLP_LR:-2.5e-6}
+ACTION_LR=${ACTION_LR:-1e-5}
+HIGH_NOISE_FRACTION=${HIGH_NOISE_FRACTION:-0.5}
+HIGH_NOISE_MIN_TIME=${HIGH_NOISE_MIN_TIME:-0.8}
+FIXED_EVAL_SEED=${FIXED_EVAL_SEED:-20260909}
 NORMALIZATION_MAPPING=${NORMALIZATION_MAPPING:-'{"VISUAL":"IDENTITY","STATE":"QUANTILES","ACTION":"QUANTILES"}'}
 LOG_FREQ=${LOG_FREQ:-20}
-SCHEDULER_WARMUP_STEPS=${SCHEDULER_WARMUP_STEPS:-1000}
-SCHEDULER_DECAY_STEPS=${SCHEDULER_DECAY_STEPS:-20000}
+SCHEDULER_WARMUP_STEPS=${SCHEDULER_WARMUP_STEPS:-250}
+SCHEDULER_DECAY_STEPS=${SCHEDULER_DECAY_STEPS:-5000}
 WANDB_ENABLE=${WANDB_ENABLE:-true}
 WANDB_PROJECT=${WANDB_PROJECT:-threading_pi05}
-JOB_NAME=${JOB_NAME:-threading_combined_pi05_conditioned_v7_visual_expert_no_gripper}
+JOB_NAME=${JOB_NAME:-threading_combined_pi05_conditioned_v9_full_expert}
 GPU_IDS=${GPU_IDS:-0,1,3,4,5,6}
 NUM_PROCESSES=${NUM_PROCESSES:-6}
 
@@ -75,21 +79,30 @@ if [[ "${TRAIN_EXPERT_ONLY}" == "true" && "${FREEZE_VISION_ENCODER}" != "true" ]
   echo "TRAIN_EXPERT_ONLY=true already freezes the vision encoder; set FREEZE_VISION_ENCODER=true for an unambiguous run config." >&2
   exit 2
 fi
-if [[ "${FINETUNE_MODE}" != "default" && "${FINETUNE_MODE}" != "visual_expert" ]]; then
-  echo "FINETUNE_MODE must be default or visual_expert; got ${FINETUNE_MODE}." >&2
+if [[ "${FINETUNE_MODE}" != "default" && "${FINETUNE_MODE}" != "visual_expert" && "${FINETUNE_MODE}" != "visual_full_expert" ]]; then
+  echo "FINETUNE_MODE must be default, visual_expert, or visual_full_expert; got ${FINETUNE_MODE}." >&2
   exit 2
 fi
-if [[ "${FINETUNE_MODE}" == "visual_expert" ]] && \
+if [[ "${FINETUNE_MODE}" != "default" ]] && \
    [[ "${FREEZE_VISION_ENCODER}" != "false" || "${TRAIN_EXPERT_ONLY}" != "false" ]]; then
   echo "visual_expert mode requires both base freeze flags to be false." >&2
   exit 2
 fi
-python - "${VISION_LR_SCALE}" <<'PY'
+python - "${VISION_LR}" "${PROJECTOR_LR}" "${EXPERT_ATTENTION_LR}" "${EXPERT_MLP_LR}" "${ACTION_LR}" \
+  "${HIGH_NOISE_FRACTION}" "${HIGH_NOISE_MIN_TIME}" <<'PY'
 import sys
 
-scale = float(sys.argv[1])
-if not 0.0 < scale <= 1.0:
-    raise SystemExit("VISION_LR_SCALE must be in (0, 1]")
+for name, raw in zip(
+    ("VISION_LR", "PROJECTOR_LR", "EXPERT_ATTENTION_LR", "EXPERT_MLP_LR", "ACTION_LR"),
+    sys.argv[1:6], strict=True,
+):
+    if float(raw) <= 0:
+        raise SystemExit(f"{name} must be positive")
+fraction, minimum = map(float, sys.argv[6:8])
+if not 0 <= fraction <= 1:
+    raise SystemExit("HIGH_NOISE_FRACTION must be in [0, 1]")
+if not 0 <= minimum < 1:
+    raise SystemExit("HIGH_NOISE_MIN_TIME must be in [0, 1)")
 PY
 python - "${PROPRIOCEPTION_DROPOUT}" <<'PY'
 import sys
@@ -215,7 +228,14 @@ export PI05_PROPRIO_DROPOUT="${PROPRIOCEPTION_DROPOUT}"
 export PI05_IGNORE_GRIPPER_ACTION="${IGNORE_GRIPPER_ACTION}"
 export PI05_GRIPPER_TARGET_NORMALIZED="${GRIPPER_TARGET_NORMALIZED}"
 export PI05_FINETUNE_MODE="${FINETUNE_MODE}"
-export PI05_VISION_LR_SCALE="${VISION_LR_SCALE}"
+export PI05_VISION_LR="${VISION_LR}"
+export PI05_PROJECTOR_LR="${PROJECTOR_LR}"
+export PI05_EXPERT_ATTENTION_LR="${EXPERT_ATTENTION_LR}"
+export PI05_EXPERT_MLP_LR="${EXPERT_MLP_LR}"
+export PI05_ACTION_LR="${ACTION_LR}"
+export PI05_HIGH_NOISE_FRACTION="${HIGH_NOISE_FRACTION}"
+export PI05_HIGH_NOISE_MIN_TIME="${HIGH_NOISE_MIN_TIME}"
+export PI05_FIXED_EVAL_SEED="${FIXED_EVAL_SEED}"
 
 exec torchrun --standalone --nproc-per-node="${NUM_PROCESSES}" \
   "${PI05_DIR}/train_with_state_dropout.py" \

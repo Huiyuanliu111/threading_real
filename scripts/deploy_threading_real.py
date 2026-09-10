@@ -527,6 +527,7 @@ def run(args: argparse.Namespace) -> int:
         from threading_task.policy import enable_map_gmm_inference
 
         enable_map_gmm_inference(policy)
+        policy.use_sample = "map"
     else:
         policy.use_sample = args.gmm_eval_mode == "sample"
 

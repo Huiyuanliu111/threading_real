@@ -49,32 +49,34 @@ cd /home/huiyuan/teleoperation
 validation loss。
 
 条件敏感度实验显示旧 π0.5 checkpoint 对图像变化的响应仅约为随机 noise 变化的
-9.4%。任务文本和场景固定，因此新的默认 profile 冻结 PaliGemma 语言骨干与
-词嵌入，训练 SigLIP vision tower、multimodal projector 和 action expert。
-vision tower 使用 action expert 的 0.1 倍学习率；当前训练使用完整的 state
-prompt，不执行状态丢弃。
+9.4%。当前验证性 profile 冻结 PaliGemma 语言骨干、词嵌入和 action expert 的
+MLP，只训练 SigLIP vision tower、multimodal projector、expert attention 和
+action/time projections。训练时对 15% 样本删除 state prompt；另外一半样本使用
+`[0.8, 1.0]` 的高噪声 flow timestep，降低模型从带噪真实动作中学习边缘分布的
+捷径。推理与验证始终使用完整 state prompt。
 状态和动作使用 π0.5 的 quantile normalization。这个任务不需要夹爪开合，因此
 训练 wrapper 会在 flow input 和 target 建立前，把记录的第 7 维 gripper delta
 替换为物理零动作对应的归一化常数；部署代码在反归一化后再次强制
 `dgripper=0`。模型只从数据学习前 6 维 Cartesian 轨迹，同时保留受监督的稳定
 no-op gripper 通道。
-它使用 2 次梯度累积，将有效 optimizer batch
-设为 12，并运行 20,000 个 microstep；六卡每卡 batch 1 时共读取 120,000 个样本，
-相当于当前 11,390 帧训练 split 的约 10.5 次遍历。
+六卡每卡 batch 2，不使用梯度累积，因此每个 step 都是一次真实 optimizer update，
+有效 batch 为 12。首轮只运行 1,500 updates，约遍历训练 split 1.58 次。
 
 ```bash
 cd /home/huiyuan/teleoperation
 source .venv-pi05/bin/activate
-GPU_IDS=0,1,3,4,5,6 NUM_PROCESSES=6 BATCH_SIZE=1 \
-  GRADIENT_ACCUMULATION=2 STEPS=20000 SAVE_FREQ=10000 EVAL_FREQ=1000 \
-  PROPRIOCEPTION_DROPOUT=0 IGNORE_GRIPPER_ACTION=true \
-  FINETUNE_MODE=visual_expert VISION_LR_SCALE=0.1 \
+GPU_IDS=0,1,3,4,5,6 NUM_PROCESSES=6 BATCH_SIZE=2 \
+  GRADIENT_ACCUMULATION=1 STEPS=1500 SAVE_FREQ=500 EVAL_FREQ=500 \
+  PROPRIOCEPTION_DROPOUT=0.15 IGNORE_GRIPPER_ACTION=true \
+  FINETUNE_MODE=visual_expert VISION_LR=2.5e-6 PROJECTOR_LR=1e-5 \
+  EXPERT_ATTENTION_LR=5e-6 ACTION_LR=1e-5 \
+  HIGH_NOISE_FRACTION=0.5 HIGH_NOISE_MIN_TIME=0.8 \
   bash threading_real/pi05/train_full.sh
 ```
 
 loss 默认同步到 W&B 项目 `threading_pi05`。关闭同步可设置
 `WANDB_ENABLE=false`。新结果写入
-`pi05/outputs/threading_combined_pi05_conditioned_v7_visual_expert_no_gripper`，不会覆盖旧 checkpoint。
+`pi05/outputs/threading_combined_pi05_conditioned_v8_visual_forced_probe`，不会覆盖旧 checkpoint。
 当前 `*_nozero` 数据和零动作过滤保持不变。
 
 训练脚本固定：
@@ -82,12 +84,13 @@ loss 默认同步到 W&B 项目 `threading_pi05`。关闭同步可设置
 - `chunk_size=10`
 - `n_action_steps=10`
 - `eval_split=0.2`
-- 每 1,000 microstep 在固定的 512 个验证样本上计算 loss
-- 每 10,000 microstep 保存 checkpoint（20,000 steps 保存中点和最终模型）
-- 每 20 microstep 汇总一次 loss；六卡归约后每个点包含 120 个样本
-- 训练、validation 和 inference 均保留完整状态提示
+- 每 500 update 在固定的 512 个验证样本上计算 loss，并保存 checkpoint
+- validation 的 flow noise/timestep 按 batch index 固定，保证不同 checkpoint 可比
+- 每 20 update 汇总一次 loss；六卡归约后每个点包含 240 个样本
+- 训练样本使用 15% state prompt dropout，validation 和 inference 使用完整状态提示
 - 忽略数据中的 gripper delta，并将部署动作的第 7 维固定为零
-- 冻结 PaliGemma 语言骨干，vision tower 使用 0.1 倍学习率微调
+- 冻结 PaliGemma 语言骨干和 expert MLP，微调视觉路径、expert attention 与动作投影
+- 50% 样本使用 `[0.8, 1.0]` 高噪声 timestep
 - bfloat16、gradient checkpointing、六卡 DDP
 
 首次在训练服务器配置环境：
@@ -106,8 +109,8 @@ export HF_TOKEN
 根分区额外保留一份 wheel 缓存。
 
 训练脚本把 Hugging Face 和 W&B 缓存固定在项目的 `.cache/` 下，避免同一用户的
-多个缓存目录重复下载权重。不要把 `SAVE_FREQ` 改成很小的值；默认只生成 step
-10,000 的中点 checkpoint 和 step 20,000 的最终 checkpoint。训练前后可用
+多个缓存目录重复下载权重。短跑默认生成 step 500、1,000、1,500 三个
+checkpoint。训练前后可用
 `df -h "$HOME"` 和 `du -sh ~/pi05/* ~/pi05/.cache/*` 检查占用。
 
 GPU 被其他任务占用时，可在远端后台等待 GPU 4、5。脚本要求连续三次检查（默认
@@ -182,7 +185,7 @@ python threading_real/scripts/deploy_threading_real_cartesian.py \
   --server-ip 10.157.175.22 \
   --udp-ip 10.157.175.211 \
   --policy-hz 15 \
-  --execute-steps 1 \
+  --execute-steps 10 \
   --max-cycles 20
 ```
 
@@ -200,7 +203,7 @@ python threading_real/scripts/deploy_threading_real_cartesian.py \
   --server-ip 10.157.175.22 \
   --udp-ip 10.157.175.211 \
   --policy-hz 15 \
-  --execute-steps 1 \
+  --execute-steps 10 \
   --max-cycles 1 \
   --workspace-min 0.410 -0.243 -0.101 \
   --workspace-max 0.538 0.199 0.107 \
