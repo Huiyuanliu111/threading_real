@@ -7,7 +7,7 @@ replacement from a synchronized LeRobot recording by clicking the physical TCP
 center in well-spread frames from each fixed camera:
 
 ```bash
-conda run -n pushbox python scripts/calibrate_threading_spatial.py \
+conda run -n pushbox python scripts/calibration/fit.py \
   --dataset /home/huiyuan/teleoperation/data/block_grasp_minimal_lerobot_v3_cartesian_stride5_224 \
   --urdf /home/huiyuan/teleoperation/remote_controller/src/remote_controller/assets/panda/panda_arm.urdf \
   --output calibration/block_grasp_spatial.json \
@@ -35,7 +35,7 @@ recommended calibration path because it captures both fixed cameras and the
 follower state only after the TCP is stationary:
 
 ```bash
-conda run -n pushbox python scripts/calibrate_threading_spatial_live.py \
+conda run -n pushbox python scripts/calibration/live.py \
   --server-url http://10.157.175.22:8008/RPC2 \
   --udp-ip <THIS_COMPUTER_IP_REACHABLE_FROM_FOLLOWER> \
   --output calibration/block_grasp_spatial.json

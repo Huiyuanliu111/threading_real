@@ -1044,7 +1044,7 @@ class ThreadingSpatialLeRobotDataset(ThreadingRealLeRobotDataset):
     Every frame in an episode is supervised toward one terminal TCP waypoint.
     This turns the minimal approach task into visual goal localization instead
     of next-delta regression. Fixed-camera projection matrices are estimated by
-    ``scripts/calibrate_threading_spatial.py``.
+    ``scripts/calibration/fit.py``.
     """
 
     def __init__(

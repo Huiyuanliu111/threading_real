@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Train an ARP checkpoint for the real Threading task.
+
+This stable entry point delegates to the existing Hydra trainer and its
+configuration files in ``pushbox/configs``.
+"""
+from __future__ import annotations
+
+import runpy
+from pathlib import Path
+
+
+if __name__ == "__main__":
+    runpy.run_path(
+        str(Path(__file__).resolve().parents[2] / "pushbox" / "train.py"),
+        run_name="__main__",
+    )

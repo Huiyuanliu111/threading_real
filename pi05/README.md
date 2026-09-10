@@ -8,7 +8,7 @@
 最终数据集默认位于：
 
 ```text
-data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d
+data/threading_combined_pi05_15hz_sg5_continuous_tcp_pose_6d
 ```
 
 数据由 `data/threading_new_1` 和 `data/threading_new_2` 动态发现并合并，当前应为
@@ -20,13 +20,16 @@ data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d
 4. 本体状态通过同一套 FK 转为 TCP 的 `[xyz, rotation-6D, gripper_width]`；
 5. 对重建的平移轨迹应用 Savitzky–Golay `(window=5, polyorder=2)` 滤波；
 6. 计算 `t -> t+2` 动作并从 30 Hz 降采样到 15 Hz；
-7. 删除平移 `<1 mm`、旋转 `<0.01 rad` 且夹爪变化 `<0.5 mm` 的动作。
+7. 保留全部固定频率帧，包括零动作帧，使图像、状态和动作始终保持连续的 15 Hz 时间轴。
+
+`--drop-zero-actions` 只用于消融实验。它会删除对应的视觉和状态帧，从而造成时间跳变，
+不应作为正式训练数据的默认设置。
 
 生成数据：
 
 ```bash
 cd /home/huiyuan/teleoperation
-.venv-smolvla/bin/python threading_real/pi05/build_combined_dataset.py \
+.venv-smolvla/bin/python threading_real/pi05/training/build_dataset.py \
   --raw-root data/threading_new_1 \
   --raw-root data/threading_new_2 \
   --state-representation tcp_pose_6d \
@@ -39,9 +42,9 @@ cd /home/huiyuan/teleoperation
 单独检查最终数据：
 
 ```bash
-.venv-smolvla/bin/python threading_real/pi05/preflight.py \
-  --dataset-root data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d \
-  --repo-id threading_real/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d \
+.venv-smolvla/bin/python threading_real/pi05/training/preflight.py \
+  --dataset-root data/threading_combined_pi05_15hz_sg5_continuous_tcp_pose_6d \
+  --repo-id threading_real/threading_combined_pi05_15hz_sg5_continuous_tcp_pose_6d \
   --state-representation tcp_pose_6d \
   --expected-episodes 80
 ```
@@ -49,10 +52,10 @@ cd /home/huiyuan/teleoperation
 已有的 joint-state Cartesian 数据集可以直接转换，无需重新编码视频：
 
 ```bash
-.venv-pi05/bin/python threading_real/pi05/convert_state_dataset.py \
+.venv-pi05/bin/python threading_real/pi05/training/convert_state_dataset.py \
   data/threading_combined_pi05_15hz_sg5_nozero \
-  data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d \
-  --repo-id threading_real/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d \
+  data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d_legacy \
+  --repo-id threading_real/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d_legacy \
   --state-representation tcp_pose_6d
 ```
 
@@ -89,19 +92,19 @@ GPU_IDS=0,1,3,4,5,6 NUM_PROCESSES=6 BATCH_SIZE=2 \
   FINETUNE_MODE=visual_expert VISION_LR=2.5e-6 PROJECTOR_LR=1e-5 \
   EXPERT_ATTENTION_LR=5e-6 ACTION_LR=1e-5 \
   HIGH_NOISE_FRACTION=0.5 HIGH_NOISE_MIN_TIME=0.8 \
-  bash threading_real/pi05/train_full.sh
+  bash threading_real/pi05/training/train.sh
 ```
 
 训练前可检查所有最终生效的参数，不会访问 GPU 或下载模型：
 
 ```bash
-PRINT_CONFIG_ONLY=true bash threading_real/pi05/train_full.sh
+PRINT_CONFIG_ONLY=true bash threading_real/pi05/training/train.sh
 ```
 
 loss 默认同步到 W&B 项目 `threading_pi05`。关闭同步可设置
 `WANDB_ENABLE=false`。新结果写入
-`pi05/outputs/threading_combined_pi05_tcp_pose_6d_v1`，不会覆盖旧 checkpoint。
-当前 `*_nozero` 数据和零动作过滤保持不变。
+`pi05/outputs/threading_combined_pi05_tcp_pose_6d_continuous_v1`，不会覆盖旧 checkpoint。
+正式训练默认使用连续数据，不删除零动作帧。
 
 训练脚本与本文有关的主要默认值如下，均可通过同名环境变量覆盖：
 
@@ -129,7 +132,7 @@ loss 默认同步到 W&B 项目 `threading_pi05`。关闭同步可设置
 cd ~/pi05
 curl -LsSf https://astral.sh/uv/install.sh | sh  # 仅在尚未安装 uv 时执行
 source "$HOME/.local/bin/env"
-bash pi05/bootstrap_remote.sh
+bash pi05/training/bootstrap_remote.sh
 source .venv-pi05/bin/activate
 read -r -s -p "HF token: " HF_TOKEN; echo
 export HF_TOKEN
@@ -152,7 +155,7 @@ GPU 被其他任务占用时，可在远端后台等待默认的 GPU `0,1,3,4,5,
 mkdir -p ~/pi05/logs
 read -r -s -p "HF token: " HF_TOKEN; echo
 export HF_TOKEN
-nohup setsid bash ~/pi05/pi05/wait_for_gpus_and_train.sh \
+nohup setsid bash ~/pi05/pi05/training/wait_for_gpus_and_train.sh \
   > ~/pi05/logs/wait-and-train.log 2>&1 &
 echo $! > ~/pi05/wait-and-train.pid
 unset HF_TOKEN
@@ -171,9 +174,9 @@ kill -- "-$(cat ~/pi05/wait-and-train.pid)"
 ## Checkpoint 推理检查
 
 ```bash
-python threading_real/pi05/infer_one.py \
-  --checkpoint threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_v1/checkpoints/last/pretrained_model \
-  --dataset-root data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d \
+python threading_real/pi05/diagnostics/infer_one.py \
+  --checkpoint threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_continuous_v1/checkpoints/last/pretrained_model \
+  --dataset-root data/threading_combined_pi05_15hz_sg5_continuous_tcp_pose_6d \
   --frame 0
 ```
 
@@ -211,8 +214,8 @@ cd /home/truphysics/teleoperation/remote_controller
 ```bash
 cd /home/huiyuan/teleoperation
 source .venv-pi05/bin/activate
-python threading_real/scripts/deploy_threading_real_cartesian.py \
-  threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_v1/checkpoints/last/pretrained_model \
+python threading_real/scripts/deployment/cartesian.py \
+  threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_continuous_v1/checkpoints/last/pretrained_model \
   --task "insert the grasped block through the needle" \
   --server-url http://10.157.175.22:8008/RPC2 \
   --server-ip 10.157.175.22 \
@@ -229,8 +232,8 @@ replace 异步模式；该模式没有 π0.5 RTC 延迟补偿，不用于实机�
 清空工作空间并确认急停可用后，先执行一个同步单步周期：
 
 ```bash
-python threading_real/scripts/deploy_threading_real_cartesian.py \
-  threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_v1/checkpoints/last/pretrained_model \
+python threading_real/scripts/deployment/cartesian.py \
+  threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_continuous_v1/checkpoints/last/pretrained_model \
   --task "insert the grasped block through the needle" \
   --server-url http://10.157.175.22:8008/RPC2 \
   --server-ip 10.157.175.22 \
@@ -251,8 +254,8 @@ runner 默认不限制 TCP workspace。如需启用边界检查，同时传入
 episode；模型、processor、相机和控制客户端只加载一次：
 
 ```bash
-python threading_real/scripts/deploy_threading_real_cartesian.py \
-  threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_v1/checkpoints/last/pretrained_model \
+python threading_real/scripts/deployment/cartesian.py \
+  threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_continuous_v1/checkpoints/last/pretrained_model \
   --task "insert the grasped block through the needle" \
   --server-url http://10.157.175.22:8008/RPC2 \
   --server-ip 10.157.175.22 \
@@ -280,9 +283,9 @@ Enter 结束 episode。任务假定方块已位于夹爪中，`--grasp-before-in
 Selector 与 π0.5 分开训练。先从真实机器人 Cartesian 动作生成 `{4,10}` 的概率标签：
 
 ```bash
-python threading_real/scripts/label_lerobot_tcp_chunks.py \
-  --dataset data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d \
-  --output data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d_tcp_chunk_soft_labels_4_10_smoothed \
+python threading_real/scripts/chunk_selector/label_tcp_chunks.py \
+  --dataset data/threading_combined_pi05_15hz_sg5_continuous_tcp_pose_6d \
+  --output data/threading_combined_pi05_15hz_sg5_continuous_tcp_pose_6d_tcp_chunk_soft_labels_4_10_smoothed \
   --candidate-chunks 4 10 \
   --smoothing-window 5 \
   --label-smoothing-window 3
@@ -292,10 +295,10 @@ python threading_real/scripts/label_lerobot_tcp_chunks.py \
 token 池化为 `4×4`，每帧共缓存 32 个 token：
 
 ```bash
-python threading_real/pi05/extract_selector_features.py \
-  --checkpoint threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_v1/checkpoints/last/pretrained_model \
-  --dataset-root data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d \
-  --labels data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d_tcp_chunk_soft_labels_4_10_smoothed/labels.parquet \
+python threading_real/pi05/chunk_selector/extract_features.py \
+  --checkpoint threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_continuous_v1/checkpoints/last/pretrained_model \
+  --dataset-root data/threading_combined_pi05_15hz_sg5_continuous_tcp_pose_6d \
+  --labels data/threading_combined_pi05_15hz_sg5_continuous_tcp_pose_6d_tcp_chunk_soft_labels_4_10_smoothed/labels.parquet \
   --output data/threading_combined_pi05_selector_soft_4_10.hdf5 \
   --batch-size 4 \
   --num-workers 2
@@ -305,7 +308,7 @@ python threading_real/pi05/extract_selector_features.py \
 `4*p4 + 10*p10` 得到连续 chunk，再四舍五入为 4 到 10 的执行步数：
 
 ```bash
-python threading_real/scripts/train_chunk_selector.py \
+python threading_real/scripts/chunk_selector/train.py \
   data/threading_combined_pi05_selector_soft_4_10.hdf5 \
   --output-dir threading_real/pi05/outputs/selector_soft_4_10 \
   --use-target-probabilities \
@@ -319,8 +322,7 @@ python threading_real/scripts/train_chunk_selector.py \
 
 这一步只训练约几百万参数的 selector，π0.5 全部冻结，不需要联合训练。特征提取会
 加载约 8.8 GB 的 π0.5 权重；`--batch-size 4` 适用于本机 16 GB 4060 Ti，如果显存
-仍受其他进程占用则降为 2 或 1。缓存采用 float16，14,054 帧、每帧 `32×2048`
-大约占 1.8 GB。
+仍受其他进程占用则降为 2 或 1。缓存采用 float16，每帧 `32×2048`。
 
 ## 两种 chunk 推理路径对比
 
@@ -335,10 +337,10 @@ selector、动作生成和总耗时，避免固定先后顺序造成 warmup 偏�
 ```bash
 cd /home/huiyuan/teleoperation
 source .venv-pi05/bin/activate
-python threading_real/pi05/benchmark_prediction_modes.py \
-  --checkpoint threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_v1/checkpoints/last/pretrained_model \
+python threading_real/pi05/deployment/benchmark_prediction_modes.py \
+  --checkpoint threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_continuous_v1/checkpoints/last/pretrained_model \
   --selector threading_real/pi05/outputs/selector_soft_4_10 \
-  --dataset-root data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d \
+  --dataset-root data/threading_combined_pi05_15hz_sg5_continuous_tcp_pose_6d \
   --samples 100 \
   --warmup 3 \
   --output-dir threading_real/pi05/outputs/offline_mode_benchmark
@@ -351,7 +353,7 @@ python threading_real/pi05/benchmark_prediction_modes.py \
 
 ```bash
 # 路径 A：只生成 selector 所需的 k 步
-bash threading_real/pi05/run_required_only.sh \
+bash threading_real/pi05/deployment/run_required_only.sh \
   --task "insert the grasped block through the needle" \
   --server-url http://10.157.175.22:8008/RPC2 \
   --server-ip 10.157.175.22 \
@@ -361,7 +363,7 @@ bash threading_real/pi05/run_required_only.sh \
   --execute --confirm-real-robot
 
 # 路径 B：始终生成 10 步，再执行 selector 所需的前 k 步
-bash threading_real/pi05/run_full_then_truncate.sh \
+bash threading_real/pi05/deployment/run_full_then_truncate.sh \
   --task "insert the grasped block through the needle" \
   --server-url http://10.157.175.22:8008/RPC2 \
   --server-ip 10.157.175.22 \
@@ -374,7 +376,7 @@ bash threading_real/pi05/run_full_then_truncate.sh \
 汇总全部实机 trial 的成功率和平均推理速度：
 
 ```bash
-python threading_real/pi05/summarize_real_trials.py \
+python threading_real/pi05/deployment/summarize_trials.py \
   threading_real/pi05/outputs/adaptive_comparison \
   --output threading_real/pi05/outputs/adaptive_comparison/summary.json
 ```

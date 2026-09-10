@@ -25,7 +25,7 @@ def load_projection_calibration(
     if not path.is_file():
         raise FileNotFoundError(
             f"spatial camera calibration not found: {path}. Run "
-            "scripts/calibrate_threading_spatial.py first."
+            "scripts/calibration/fit.py first."
         )
     payload = json.loads(path.read_text())
     cameras = payload.get("cameras", {})

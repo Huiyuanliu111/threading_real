@@ -6,12 +6,12 @@ import numpy as np
 import torch
 
 from pushbox.diffusion_policy.model.common.normalizer import LinearNormalizer
-from scripts.calibrate_threading_spatial import (
+from scripts.calibration.fit import (
     farthest_point_rows,
     fit_projection_matrix,
     reprojection_errors,
 )
-from scripts.calibrate_threading_spatial_live import (
+from scripts.calibration.live import (
     _parser,
     fit_camera_extrinsics,
     load_calibration_progress,

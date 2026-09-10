@@ -32,8 +32,8 @@ After training, manually move the robot to the grasp pose and deploy without
 observation and uses only the calibrated side/front RGB-D cameras:
 
 ```bash
-conda run -n pushbox python scripts/deploy_threading_real_cartesian.py \
-  /path/to/checkpoint.ckpt --weights model --policy-hz 6 --execute-steps 1 \
+conda run -n pushbox python scripts/deployment/cartesian.py \
+  /path/to/checkpoint.ckpt --weights model --policy-hz 6 --execute-steps 10 \
   --grasp-before-inference --initial-grasp-width 0.02 \
   --execute --confirm-real-robot
 ```

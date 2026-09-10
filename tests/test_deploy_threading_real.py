@@ -9,8 +9,8 @@ import pytest
 import torch
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "deploy_threading_real.py"
-SPEC = importlib.util.spec_from_file_location("deploy_threading_real", MODULE_PATH)
+MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "deployment" / "joint.py"
+SPEC = importlib.util.spec_from_file_location("deployment_joint", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner

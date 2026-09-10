@@ -22,7 +22,7 @@ Do not resume a regression-ARP checkpoint: the output representation and loss
 are intentionally incompatible. Validate spatial localization before hardware:
 
 ```bash
-conda run -n pushbox python scripts/diagnose_threading_spatial.py \
+conda run -n pushbox python scripts/diagnostics/spatial.py \
   outputs/<run>/checkpoints/<checkpoint>.ckpt
 ```
 
@@ -62,7 +62,7 @@ Validate a converted dataset:
 
 ```bash
 cd /home/tele/threading_real
-python scripts/validate_threading_real_lerobot.py \
+python scripts/arp/validate_dataset.py \
   /path/to/threading_vla_lerobot_v3 \
   --max-episodes 3
 ```
@@ -94,7 +94,7 @@ python pushbox/train.py \
 ```
 
 The delta checkpoint is automatically converted back to absolute joint targets
-by `scripts/deploy_threading_real.py` before TrackJ receives a plan.
+by `scripts/deployment/joint.py` before TrackJ receives a plan.
 
 Real-robot rollout is disabled in `threading_real_arp.yaml`; evaluation should
 use held-out validation loss or the separate follower deployment runner below.
@@ -130,7 +130,7 @@ sends gripper commands:
 
 ```bash
 cd /home/huiyuan/teleoperation/threading_real
-python scripts/deploy_threading_real.py \
+python scripts/deployment/joint.py \
   /path/to/three_view_joint_checkpoint.ckpt \
   --server-url http://localhost:8008/RPC2 \
   --server-ip 127.0.0.1 \
@@ -146,7 +146,7 @@ After inspecting the dry-run predictions and clearing the workspace, real
 motion requires both acknowledgement flags:
 
 ```bash
-python scripts/deploy_threading_real.py \
+python scripts/deployment/joint.py \
   /path/to/three_view_joint_checkpoint.ckpt \
   --execute --confirm-real-robot \
   --move-to-training-start
@@ -172,7 +172,7 @@ mode.
 
 ### Cartesian-delta deployment
 
-`scripts/deploy_threading_real_cartesian.py` is for checkpoints trained with
+`scripts/deployment/cartesian.py` is for checkpoints trained with
 `action_mode: cartesian_delta`. It reads the live joint state, computes the
 `panda_hand_tcp` pose with the packaged URDF, integrates base-frame TCP deltas,
 and streams the resulting poses through TrackC (UDP port 9200 by default).
@@ -200,7 +200,7 @@ and cameras but does not start TrackC or send gripper commands:
 cd /home/huiyuan/teleoperation/threading_real
 source /home/huiyuan/miniconda3/etc/profile.d/conda.sh
 conda activate pushbox
-python scripts/deploy_threading_real_cartesian.py \
+python scripts/deployment/cartesian.py \
   /path/to/cartesian_delta_checkpoint.ckpt \
   --server-url http://10.157.175.22:8008/RPC2 \
   --server-ip 10.157.175.22 --udp-ip 10.157.175.211 \
@@ -211,7 +211,7 @@ After checking the printed deltas and clearing the workspace, begin with one
 synchronous real cycle:
 
 ```bash
-python scripts/deploy_threading_real_cartesian.py \
+python scripts/deployment/cartesian.py \
   /path/to/cartesian_delta_checkpoint.ckpt \
   --server-url http://10.157.175.22:8008/RPC2 \
   --server-ip 10.157.175.22 --udp-ip 10.157.175.211 \

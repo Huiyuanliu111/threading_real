@@ -11,8 +11,8 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "deploy_threading_real_cartesian.py"
-SPEC = importlib.util.spec_from_file_location("deploy_threading_real_cartesian", MODULE_PATH)
+MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "deployment" / "cartesian.py"
+SPEC = importlib.util.spec_from_file_location("deployment_cartesian", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
