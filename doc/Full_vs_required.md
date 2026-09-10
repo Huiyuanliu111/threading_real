@@ -1,7 +1,8 @@
 # Full-then-truncate vs Required-only
 
-本文定义两种 adaptive action chunk 解码方式，并分别记录当前能在输出目录中找到的
-PushBox、Threading、ALOHA 结果。
+本文定义两种 adaptive action chunk 解码方式，并记录已有的 PushBox、Threading、
+ALOHA 实验结果。PushBox 数值来自文中列出的外部实验目录；这些产物未包含在当前
+`threading_real` 仓库中，表格是历史结果摘要。
 
 ## 定义
 
@@ -23,28 +24,31 @@ discard : a_{k+1}, ..., a_H
 
 ### required_only
 
-`required_only` 指当前选择 `k`，就只生成本次需要执行的 action：
+`required_only` 指当前选择 `k`，就只生成得到这 `k` 个可执行 action 所需的最短
+预测序列。没有前置丢弃槽位的策略（如当前 π0.5）会直接生成 `k` 个 action：
 
 ```text
 generate: a_1, ..., a_k
 execute : a_1, ..., a_k
 ```
 
-因此 `k` 同时改变生成长度、执行长度和重新规划频率。短 chunk 可以减少生成 token，
-但也可能因为预测 horizon 变短而引入和训练 full horizon 不同的分布。
+PushBox 会丢弃索引 0 的旧观测对齐预测，因此它需要生成 `k+1` 个 token，再执行后面
+的 `k` 个 action；表格中的 `tokens/call` 正是按这个实现统计。`k` 同时改变生成长度、
+执行长度和重新规划频率。短 chunk 可以减少生成 token，但也可能因为预测 horizon
+变短而引入和训练 full horizon 不同的分布。
 
 一句话：
 
 ```text
 full_then_truncate = always generate H, execute first k
-required_only      = generate k, execute k
+required_only      = generate k plus required dropped prefix slots, execute k
 ```
 
 ## PushBox
 
 PushBox 里有最明确的 full/required 对比实验。
 
-主结果路径：
+外部 PushBox 实验的主结果路径：
 
 ```text
 /home/huiyuan/pushbox/outputs/pushbox_prediction_mode_matrix
@@ -127,6 +131,8 @@ required-only 下可以超过 fixed baselines。
 
 ## Threading
 
-
+当前文档尚未纳入可复核的 Threading full/required 对比结果。
 
 ## ALOHA
+
+当前文档尚未纳入可复核的 ALOHA full/required 对比结果。

@@ -1,8 +1,10 @@
 # Threading spatial camera calibration
 
-`block_grasp_spatial.json` is deliberately not committed with invented values.
-Generate it from the synchronized LeRobot recording by clicking the physical
-TCP center in well-spread frames from each fixed camera:
+`block_grasp_spatial.json` contains the tracked live stationary PnP calibration
+used by the current spatial policy. Regenerate it whenever the cameras, their
+mounts, or the robot base relationship changes. The offline tool can estimate a
+replacement from a synchronized LeRobot recording by clicking the physical TCP
+center in well-spread frames from each fixed camera:
 
 ```bash
 conda run -n pushbox python scripts/calibrate_threading_spatial.py \
@@ -27,9 +29,10 @@ Do not train if the reported reprojection RMSE is above roughly 4 pixels at
 
 ## Recommended live calibration
 
-The offline recorder does not preserve a shared camera/robot clock, so moving
-frames can associate a pixel with the wrong joint state. The live tool captures
-both fixed cameras and the follower state only after the TCP is stationary:
+Current recordings preserve a shared host monotonic clock and the converter
+aligns camera and robot samples by nearest timestamp. The live tool remains the
+recommended calibration path because it captures both fixed cameras and the
+follower state only after the TCP is stationary:
 
 ```bash
 conda run -n pushbox python scripts/calibrate_threading_spatial_live.py \

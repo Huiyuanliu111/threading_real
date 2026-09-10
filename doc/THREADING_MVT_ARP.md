@@ -35,6 +35,5 @@ observation and uses only the calibrated side/front RGB-D cameras:
 conda run -n pushbox python scripts/deploy_threading_real_cartesian.py \
   /path/to/checkpoint.ckpt --weights model --policy-hz 6 --execute-steps 1 \
   --grasp-before-inference --initial-grasp-width 0.02 \
-  --workspace-min 0.15 -0.40 -0.15 --workspace-max 0.75 0.30 0.50 \
   --execute --confirm-real-robot
 ```

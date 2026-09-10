@@ -41,9 +41,11 @@ python convert_vla_to_lerobot_v3.py \
 ```
 
 The converter uses the official `lerobot` writer and creates v3 `meta/`,
-`data/`, and `videos/` shards. The current raw recorder does not persist camera
-or robot timestamps, so conversion uses normalized episode progress for 30 FPS
-alignment and records this limitation in `meta/vla_conversion_report.json`.
+`data/`, and `videos/` shards. Current recordings persist a shared host
+monotonic timestamp for robot and camera samples, so conversion aligns each
+stream by nearest timestamp and records the measured skew in
+`meta/vla_conversion_report.json`. Legacy recordings without timestamps remain
+supported through an approximate normalized-episode-progress fallback.
 The default raw-camera mapping is `cam1.mp4` = side view and `cam3.mp4` = front
 view. The wrist camera is not part of the current training dataset.
 
@@ -97,15 +99,19 @@ by `scripts/deploy_threading_real.py` before TrackJ receives a plan.
 Real-robot rollout is disabled in `threading_real_arp.yaml`; evaluation should
 use held-out validation loss or the separate follower deployment runner below.
 
-## Single-follower deployment
+## Single-follower joint-state deployment
 
 The two-arm leader/follower executable is only used to collect demonstrations.
 At deployment time, run `remote_controller_server` on the follower controller
 PC and run the Python policy client on the inference PC. The server IP used by
 the examples below depends on whether these are the same machine.
 
-The runner imports the repository-local controller client automatically. To use
-it independently elsewhere, install it in the policy environment:
+This legacy joint-state runner accepts only an 8D joint-state/action checkpoint
+whose RGB keys are exactly `sideview`, `wrist`, and `frontview`. It cannot load
+the two-view `threading_real_arp.yaml` checkpoint described above; use it only
+with a separately trained three-view joint-state checkpoint. The runner imports
+the repository-local controller client automatically. To use it independently
+elsewhere, install it in the policy environment:
 
 ```bash
 python -m pip install -e ../remote_controller
@@ -125,7 +131,7 @@ sends gripper commands:
 ```bash
 cd /home/huiyuan/teleoperation/threading_real
 python scripts/deploy_threading_real.py \
-  outputs/2026-08-31/11-10-27/checkpoints/epoch=0005-val_loss=-18.758.ckpt \
+  /path/to/three_view_joint_checkpoint.ckpt \
   --server-url http://localhost:8008/RPC2 \
   --server-ip 127.0.0.1 \
   --udp-ip 127.0.0.1 \
@@ -141,7 +147,7 @@ motion requires both acknowledgement flags:
 
 ```bash
 python scripts/deploy_threading_real.py \
-  outputs/2026-08-31/11-10-27/checkpoints/epoch=0005-val_loss=-18.758.ckpt \
+  /path/to/three_view_joint_checkpoint.ckpt \
   --execute --confirm-real-robot \
   --move-to-training-start
 ```
@@ -170,9 +176,9 @@ mode.
 `action_mode: cartesian_delta`. It reads the live joint state, computes the
 `panda_hand_tcp` pose with the packaged URDF, integrates base-frame TCP deltas,
 and streams the resulting poses through TrackC (UDP port 9200 by default).
-The runner requires `pinocchio` in the policy environment. Run dry-run first;
-real execution additionally requires explicit `--workspace-min X Y Z` and
-`--workspace-max X Y Z` bounds.
+The runner requires `pinocchio` in the policy environment. Run dry-run first.
+TCP workspace checking is disabled by default. To enable it, pass both
+`--workspace-min X Y Z` and `--workspace-max X Y Z`.
 
 For the block-grasp-minimal checkpoint, connect the three RealSense cameras to
 the GPU/inference workstation (`10.157.175.211`); the controller remains on
@@ -195,24 +201,21 @@ cd /home/huiyuan/teleoperation/threading_real
 source /home/huiyuan/miniconda3/etc/profile.d/conda.sh
 conda activate pushbox
 python scripts/deploy_threading_real_cartesian.py \
-  outputs/block_grasp_minimal_three_view/checkpoints/epoch=0075-val_loss=0.077.ckpt \
+  /path/to/cartesian_delta_checkpoint.ckpt \
   --server-url http://10.157.175.22:8008/RPC2 \
   --server-ip 10.157.175.22 --udp-ip 10.157.175.211 \
   --policy-hz 6 --execute-steps 1 --max-cycles 20
 ```
 
 After checking the printed deltas and clearing the workspace, begin with one
-synchronous real cycle. The bounds below cover the demonstration TCP workspace
-with a 3 cm margin:
+synchronous real cycle:
 
 ```bash
 python scripts/deploy_threading_real_cartesian.py \
-  outputs/block_grasp_minimal_three_view/checkpoints/epoch=0075-val_loss=0.077.ckpt \
+  /path/to/cartesian_delta_checkpoint.ckpt \
   --server-url http://10.157.175.22:8008/RPC2 \
   --server-ip 10.157.175.22 --udp-ip 10.157.175.211 \
   --policy-hz 6 --execute-steps 1 --synchronous --max-cycles 1 \
-  --workspace-min 0.301 -0.047 -0.115 \
-  --workspace-max 0.500 0.114 0.082 \
   --move-to-training-start --execute --confirm-real-robot
 ```
 
@@ -220,9 +223,10 @@ The dataset was collected at 6 Hz, so keep `--policy-hz 6`: TrackC interpolates
 each 1/6-second policy delta internally at 500 Hz. Only one small policy delta
 is executed per cycle.
 
-Add `--synchronous` for strict observe-infer-act synchronization. In this mode,
-the runner sends one predicted action chunk, waits until TrackC has sent every
-interpolated sample in that chunk, then captures the next observation.
+Strict observe-infer-act synchronization is enabled by default; pass
+`--no-synchronous` only for the asynchronous replacement mode. In synchronous
+mode, the runner sends one predicted action chunk, waits until TrackC has sent
+every interpolated sample in that chunk, then captures the next observation.
 `--policy-hz` therefore defines the duration of each action step rather than
 forcing inference at a fixed wall-clock rate. Since TrackC is an impedance
 controller, measured TCP target error is logged but does not block the next
