@@ -43,7 +43,7 @@ class ThreadingMVTARPPolicy(BaseImagePolicy):
                  hidden_dim: int = 128, vit_depth: int = 8, vit_heads: int = 8,
                  vit_mlp_dim: int = 256, arp_depth: int = 4, dropout: float = 0.1,
                  scene_bounds=(0.15, -0.40, -0.15, 0.75, 0.30, 0.50),
-                 num_latents: int = 1) -> None:
+                 num_latents: int = 1, pointcloud_max_points: int = 131072) -> None:
         super().__init__()
         if n_obs_steps != 1 or image_size % patch_size:
             raise ValueError("MVT requires n_obs_steps=1 and image_size divisible by patch_size")
@@ -51,7 +51,9 @@ class ThreadingMVTARPPolicy(BaseImagePolicy):
         self.action_dim, self.action_mode = 7, "cartesian_delta"
         self.uses_pointcloud, self.requires_tcp_pos = True, False
         self.uses_mvt = True
-        self.pointcloud_max_points = 131072
+        self.pointcloud_max_points = int(pointcloud_max_points)
+        if self.pointcloud_max_points <= 0:
+            raise ValueError("pointcloud_max_points must be positive")
         self.axis_length = 0.04
         self.rgb_keys: tuple[str, ...] = ()
         self.image_size, self.patch_size, self.hidden_dim = image_size, patch_size, hidden_dim

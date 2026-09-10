@@ -24,7 +24,8 @@ fi
 # copy of downloaded wheels after the environment has been built.
 uv venv --python "${PYTHON_VERSION}" "${ENV_DIR}"
 uv pip install --python "${ENV_DIR}/bin/python" --no-cache \
-  "lerobot[pi,training] @ git+https://github.com/huggingface/lerobot.git@${LEROBOT_COMMIT}"
+  "lerobot[pi,training] @ git+https://github.com/huggingface/lerobot.git@${LEROBOT_COMMIT}" \
+  "matplotlib>=3.8.0"
 
 echo "Environment ready: source ${ENV_DIR}/bin/activate"
 echo "LeRobot commit: ${LEROBOT_COMMIT}"
