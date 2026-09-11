@@ -1,0 +1,23 @@
+defaults:
+  - threading_new_1_mvt_arp
+  - _self_
+
+name: threading_new_1_mvt_planarp
+
+policy:
+  # PushT ordering: one sparse-plan chunk, then one dense-action chunk.
+  # Both cover the same horizon; this does not extend temporal lookahead.
+  plan_steps: 4
+  reverse_plan: true
+  action_chunk_size: ${policy.horizon}
+  predict_gripper: false
+
+training:
+  val_every: 0.5
+  checkpoint_every: 1
+
+logging:
+  mode: online
+  group: threading_real_mvt_planarp
+  name: threading_new_1_mvt_planarp
+  tags: [threading_real, mvt, arp, coarse_to_fine, planarp]

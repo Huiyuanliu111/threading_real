@@ -1,0 +1,21 @@
+defaults:
+  - threading_new_1_mvt_planarp
+  - _self_
+
+name: threading_combined_80_mvt_planarp
+
+task:
+  name: threading_combined_80_mvt_planarp
+  dataset:
+    dataset_path: /home/huiyuan/teleoperation/data/threading_combined_80_mvt_7p5hz.h5
+  shape_meta:
+    obs:
+      points: {shape: [65536, 3], type: low_dim}
+      colors: {shape: [65536, 3], type: low_dim}
+
+policy:
+  pointcloud_max_points: 65536
+
+logging:
+  name: threading_combined_80_mvt_planarp
+  tags: [threading_real, mvt, arp, coarse_to_fine, planarp, combined_80, 7p5hz]

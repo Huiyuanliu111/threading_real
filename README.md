@@ -19,3 +19,6 @@ ARP 实机执行器，因此不能直接用它运行 required-only / full-then-t
 
 空间 ARP 的相机标定工具位于 `scripts/calibration/`。历史 PushBox 与 MimicGen Threading
 仿真脚本已移除。
+
+点云 ARP 的 PushT 式稀疏计划监督使用 `threading_new_1_mvt_planarp` 配置，训练和推理
+均按“稀疏计划 → 密集动作”顺序运行，详见 [PlanARP](doc/planarp.md)。

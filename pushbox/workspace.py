@@ -42,6 +42,45 @@ def compute_grad_norm(model):
     return torch.cat(grads).norm()
 
 
+def validation_batch_boundaries(train_batches, val_every, accumulation, epoch):
+    """Validation intervals in epochs, rounded up to optimizer boundaries."""
+    interval = float(val_every)
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError("val_every must be positive and finite")
+    if interval >= 1:
+        if not interval.is_integer():
+            raise ValueError("val_every >= 1 must be an integer number of epochs")
+        return {train_batches} if (epoch + 1) % int(interval) == 0 else set()
+    parts = round(1 / interval)
+    if not math.isclose(parts * interval, 1):
+        raise ValueError("fractional val_every must evenly divide one epoch")
+    return {min(train_batches, math.ceil(train_batches * part / parts / accumulation) * accumulation)
+            for part in range(1, parts + 1)}
+
+
+@torch.no_grad()
+def evaluate_loss(policy, dataloader, device, max_steps=None, description="Validation"):
+    """Evaluate held-out losses and restore the policy's training mode."""
+    was_training = policy.training
+    totals = defaultdict(float)
+    count = 0
+    policy.eval()
+    try:
+        for index, batch in enumerate(tqdm.tqdm(dataloader, desc=description, leave=False)):
+            if max_steps is not None and index >= max_steps:
+                break
+            batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+            losses = policy.compute_loss(batch)
+            size = len(batch["action"])
+            for key, value in losses.items():
+                totals["val." + key] += value.item() * size
+            totals["val_loss"] += sum(losses.values()).item() * size
+            count += size
+    finally:
+        policy.train(was_training)
+    return {key: value / count for key, value in totals.items()} if count else {}
+
+
 def aligned_action_target(
     model: BaseImagePolicy,
     batch: dict,
@@ -254,6 +293,8 @@ class PushBoxARPWorkspace(BaseWorkspace):
                         train_batches,
                         int(train_cfg.max_train_steps),
                     )
+                validation_boundaries = validation_batch_boundaries(
+                    train_batches, train_cfg.val_every, gradient_accumulate_every, self.epoch)
                 self.optimizer.zero_grad(set_to_none=True)
                 with tqdm.tqdm(
                     train_dataloader,
@@ -311,40 +352,26 @@ class PushBoxARPWorkspace(BaseWorkspace):
                         json_logger.log(step_log)
                         self.global_step += 1
 
+                        if batch_idx + 1 in validation_boundaries:
+                            policy = self.ema_model if cfg.training.use_ema else self.model
+                            metrics = evaluate_loss(
+                                policy, val_dataloader, device, train_cfg.max_val_steps,
+                                description=f"Validation epoch {self.epoch + (batch_idx + 1) / train_batches:.3f}")
+                            metrics.update({"global_step": self.global_step,
+                                            "optimizer_step": self.optimizer_step,
+                                            "epoch": self.epoch,
+                                            "epoch_progress": self.epoch + (batch_idx + 1) / train_batches})
+                            wandb_run.log(metrics)
+                            json_logger.log(metrics)
+                            if batch_idx + 1 == train_batches:
+                                step_log.update(metrics)
+
                 step_log["train_loss"] = np.mean(train_losses)
 
                 policy = self.model
                 if train_cfg.use_ema:
                     policy = self.ema_model
                 policy.eval()
-
-                if self.epoch > 0 and (self.epoch % train_cfg.val_every) == 0:
-                    with torch.no_grad():
-                        val_losses = defaultdict(list)
-                        with tqdm.tqdm(
-                            val_dataloader,
-                            desc=f"Validation epoch {self.epoch}",
-                            leave=False,
-                            mininterval=train_cfg.tqdm_interval_sec,
-                        ) as tepoch:
-                            for batch_idx, batch in enumerate(tepoch):
-                                batch = dict_apply(
-                                    batch, lambda x: x.to(device, non_blocking=True)
-                                )
-                                val_loss_dict = policy.compute_loss(batch)
-                                for k, v in val_loss_dict.items():
-                                    val_losses["val." + k].append(v.item())
-                                val_losses["val_loss"].append(
-                                    sum(val_loss_dict.values()).detach().item()
-                                )
-                                if (
-                                    train_cfg.max_val_steps is not None
-                                    and batch_idx >= (train_cfg.max_val_steps - 1)
-                                ):
-                                    break
-                        if len(val_losses) > 0:
-                            for k, v in val_losses.items():
-                                step_log[k] = torch.mean(torch.tensor(v)).item()
 
                 if self.epoch > 0 and (self.epoch % train_cfg.sample_every) == 0:
                     with torch.no_grad():
@@ -363,7 +390,9 @@ class PushBoxARPWorkspace(BaseWorkspace):
                         )
                         step_log["train_action_mse_error"] = mse.item()
 
-                if self.epoch > 0 and (self.epoch % train_cfg.checkpoint_every) == 0:
+                # Persist the next epoch so resuming does not repeat this completed one.
+                self.epoch += 1
+                if (self.epoch % train_cfg.checkpoint_every) == 0:
                     if cfg.checkpoint.save_last_ckpt:
                         self.save_checkpoint()
                     # Subclass (e.g. ThreadingARPWorkspace) may store a rollout
@@ -385,7 +414,6 @@ class PushBoxARPWorkspace(BaseWorkspace):
 
                 wandb_run.log(step_log)
                 json_logger.log(step_log)
-                self.epoch += 1
 
                 if self.epoch == _stop_at_epoch:
                     print("Reached max epoch limit")
