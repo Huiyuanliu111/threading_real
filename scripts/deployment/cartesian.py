@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import json
+import os
 from pathlib import Path
 import select
 import signal
 import sys
+import termios
 import time
 from typing import Any, Sequence
 
@@ -433,22 +435,29 @@ def wait_for_episode_enter(prompt: str, stop_requested: Any) -> bool:
     """Wait for one Enter key while still honoring SIGINT/SIGTERM."""
     if not sys.stdin.isatty():
         raise RuntimeError("interactive episodes require a terminal on stdin")
+    terminal_fd = sys.stdin.fileno()
+    # A pasted command or repeated Enter must not start/stop the next episode.
+    termios.tcflush(terminal_fd, termios.TCIFLUSH)
     print(prompt, flush=True)
     while not stop_requested():
-        ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+        ready, _, _ = select.select([terminal_fd], [], [], 0.1)
         if ready:
-            if sys.stdin.readline() == "":
+            # Use the descriptor consistently: TextIOWrapper.readline can read
+            # ahead, hiding queued lines from select and terminal flushing.
+            if os.read(terminal_fd, 4096) == b"":
                 raise RuntimeError("terminal input closed during interactive episodes")
+            termios.tcflush(terminal_fd, termios.TCIFLUSH)
             return True
     return False
 
 
 def episode_end_requested() -> bool:
     """Consume one pending Enter key without blocking the control loop."""
-    ready, _, _ = select.select([sys.stdin], [], [], 0.0)
+    terminal_fd = sys.stdin.fileno()
+    ready, _, _ = select.select([terminal_fd], [], [], 0.0)
     if not ready:
         return False
-    if sys.stdin.readline() == "":
+    if os.read(terminal_fd, 4096) == b"":
         raise RuntimeError("terminal input closed during interactive episodes")
     return True
 

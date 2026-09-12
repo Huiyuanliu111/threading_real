@@ -78,9 +78,12 @@ def capture_live(
     voxel_m: float,
     sideview_serial: str,
     frontview_serial: str,
+    views: tuple[str, ...] = ("sideview", "frontview"),
+    capture_frames: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, dict, dict[str, np.ndarray]]:
     calibration = json.loads(calibration_path.read_text())
-    expected = {"sideview": sideview_serial, "frontview": frontview_serial}
+    serial_by_view = {"sideview": sideview_serial, "frontview": frontview_serial}
+    expected = {view: serial_by_view[view] for view in views}
     for view, serial in expected.items():
         calibrated = str(calibration["cameras"][view].get("serial", ""))
         if calibrated and calibrated != serial:
@@ -89,10 +92,17 @@ def capture_live(
     rig = RealSenseRig(
         sideview_serial, DEFAULT_WRIST_SERIAL, frontview_serial,
         width=640, height=480, fps=30, enable_depth=True,
-        enabled_views=("sideview", "frontview"),
+        enabled_views=views,
     )
     try:
-        rgbd = rig.read_rgbd(timeout_ms=3000)
+        depth_counts = {view: [] for view in views}
+        rgbd = None
+        for _ in range(capture_frames):
+            rgbd = rig.read_rgbd(timeout_ms=3000)
+            frame_by_view = dict(zip(("sideview", "wrist", "frontview"), rgbd, strict=True))
+            for view in views:
+                depth_counts[view].append(int(np.count_nonzero(frame_by_view[view][1])))
+        assert rgbd is not None
         frame_by_view = dict(zip(("sideview", "wrist", "frontview"), rgbd, strict=True))
         points, colors, per_camera = [], [], {}
         raw_depth_valid = {}
@@ -116,6 +126,15 @@ def capture_live(
             "calibration": str(calibration_path.resolve()),
             "serials": expected,
             "raw_depth_valid": raw_depth_valid,
+            "stream_depth_valid": {
+                view: {
+                    "min": int(np.min(counts)),
+                    "median": int(np.median(counts)),
+                    "max": int(np.max(counts)),
+                    "last": int(counts[-1]),
+                }
+                for view, counts in depth_counts.items()
+            },
             "cropped_before_voxel": int(cropped_count),
             "valid_points": int(valid_count),
             "bounds_m": bounds.tolist(),
@@ -192,6 +211,12 @@ def main() -> None:
     parser.add_argument("--calibration", type=Path, default=PROJECT_ROOT / "calibration/block_grasp_spatial.json")
     parser.add_argument("--sideview-serial", default=DEFAULT_SIDEVIEW_SERIAL)
     parser.add_argument("--frontview-serial", default=DEFAULT_FRONTVIEW_SERIAL)
+    parser.add_argument(
+        "--live-views", nargs="+", choices=("sideview", "frontview"),
+        default=("sideview", "frontview"),
+        help="RealSense views to fuse; pass one view for single-camera diagnostics",
+    )
+    parser.add_argument("--capture-frames", type=int, default=1)
     parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "artifacts/pointcloud_comparison")
     args = parser.parse_args()
 
@@ -201,6 +226,8 @@ def main() -> None:
     live_points, live_colors, live_meta, camera_frames = capture_live(
         args.calibration, bounds, max_points=65536, voxel_m=0.001,
         sideview_serial=args.sideview_serial, frontview_serial=args.frontview_serial,
+        views=tuple(args.live_views),
+        capture_frames=args.capture_frames,
     )
 
     write_ply(args.output / "dataset_pointcloud.ply", dataset_points, dataset_colors)
@@ -208,10 +235,10 @@ def main() -> None:
     save_cloud_figure(args.output / "dataset_pointcloud.png", dataset_points, dataset_colors,
                       bounds, f"ARP dataset | episode {args.episode}, frame {dataset_meta['frame']}")
     save_cloud_figure(args.output / "live_pointcloud.png", live_points, live_colors,
-                      bounds, "Current RealSense stream | fused side + front")
+                      bounds, f"Current RealSense stream | {' + '.join(args.live_views)}")
     save_comparison(args.output / "comparison.png",
                     (dataset_points, dataset_colors), (live_points, live_colors), bounds)
-    for view in ("sideview", "frontview"):
+    for view in args.live_views:
         plt.imsave(args.output / f"live_{view}_rgb.png", camera_frames[f"{view}_rgb"])
         depth = camera_frames[f"{view}_depth"].astype(np.float32)
         plt.imsave(args.output / f"live_{view}_depth.png", depth, cmap="turbo", vmin=0, vmax=1500)
