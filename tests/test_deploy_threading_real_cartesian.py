@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import pty
+import select
 import sys
 import threading
 
@@ -17,6 +20,32 @@ assert SPEC is not None and SPEC.loader is not None
 runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
 SPEC.loader.exec_module(runner)
+
+
+def test_start_enter_does_not_leak_into_episode_stop(monkeypatch):
+    master, slave = pty.openpty()
+    terminal = os.fdopen(slave, "r")
+    monkeypatch.setattr(runner.sys, "stdin", terminal)
+    try:
+        os.write(master, b"\n")  # leftover input from before the start prompt
+        assert select.select([slave], [], [], 1)[0]
+
+        def show_start_prompt(*args, **kwargs):
+            assert not select.select([slave], [], [], 0)[0]
+            os.write(master, b"\n\n")  # queued/repeated start Enter
+
+        monkeypatch.setattr(runner, "print", show_start_prompt, raising=False)
+        assert runner.wait_for_episode_enter("Press Enter to start", lambda: False)
+        assert not runner.episode_end_requested()
+
+        # A genuinely new Enter after startup must still stop immediately.
+        os.write(master, b"\n")
+        assert select.select([slave], [], [], 1)[0]
+        assert runner.episode_end_requested()
+        assert not runner.episode_end_requested()
+    finally:
+        terminal.close()
+        os.close(master)
 
 
 def test_synchronous_execution_is_default() -> None:
