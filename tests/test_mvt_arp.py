@@ -62,6 +62,13 @@ def _small_model(**kwargs):
         vit_depth=1, arp_depth=1, dropout=0, **kwargs)
 
 
+def test_pointcloud_views_are_checkpoint_metadata():
+    model = _small_model(pointcloud_views=("sideview",))
+    assert model.pointcloud_views == ("sideview",)
+    with pytest.raises(ValueError, match="unsupported pointcloud views"):
+        _small_model(pointcloud_views=("wrist",))
+
+
 def test_plan_resampling_excludes_padding_and_reverses_only_plan():
     model = _small_model(plan_steps=3)
     batch = _plan_batch()

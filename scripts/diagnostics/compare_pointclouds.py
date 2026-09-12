@@ -213,8 +213,8 @@ def main() -> None:
     parser.add_argument("--frontview-serial", default=DEFAULT_FRONTVIEW_SERIAL)
     parser.add_argument(
         "--live-views", nargs="+", choices=("sideview", "frontview"),
-        default=("sideview", "frontview"),
-        help="RealSense views to fuse; pass one view for single-camera diagnostics",
+        default=("sideview",),
+        help="RealSense views to use; defaults to cam1/sideview only",
     )
     parser.add_argument("--capture-frames", type=int, default=1)
     parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "artifacts/pointcloud_comparison")

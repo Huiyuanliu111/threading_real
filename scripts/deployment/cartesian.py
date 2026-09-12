@@ -47,20 +47,34 @@ def _live_rays(intrinsic: dict[str, float]) -> np.ndarray:
     ), axis=-1).astype(np.float32)
 
 
+def pointcloud_views_for_policy(policy: Any) -> tuple[str, ...]:
+    views = tuple(getattr(policy, "pointcloud_views", ("sideview", "frontview")))
+    if not views or len(set(views)) != len(views):
+        raise ValueError("checkpoint pointcloud_views must contain unique camera names")
+    unsupported = set(views) - {"sideview", "frontview"}
+    if unsupported:
+        raise ValueError(f"unsupported checkpoint pointcloud views: {sorted(unsupported)}")
+    return views
+
+
 def make_live_pointcloud_observation(
     rgbd_frames, cameras: RealSenseRig, calibration: dict[str, Any],
     q: Sequence[float], gripper_width: float, tcp_pose: np.ndarray,
     num_points: int, bounds: np.ndarray, rng: np.random.Generator,
     *, mvt_mode: bool = False, axis_length: float = 0.04,
+    pointcloud_views: Sequence[str] = ("sideview", "frontview"),
 ) -> dict[str, torch.Tensor]:
     from build_vla_pointcloud_dataset import crop_and_sample, depth_to_base_points
     from threading_task.pointcloud_dataset import rasterize_bev
 
     points, colors, camera_ids = [], [], []
     frame_by_view = dict(zip(("sideview", "wrist", "frontview"), rgbd_frames, strict=True))
-    for calibration_key, source_id in (("sideview", 0), ("frontview", 1)):
+    for source_id, calibration_key in enumerate(pointcloud_views):
         rig_index = cameras.view_names.index(calibration_key)
-        rgb, depth = frame_by_view[calibration_key]
+        frame = frame_by_view[calibration_key]
+        if frame is None:
+            raise ValueError(f"no RGB-D frame available for {calibration_key}")
+        rgb, depth = frame
         xyz, valid = depth_to_base_points(
             depth, _live_rays(cameras.color_intrinsics[rig_index]),
             cameras.depth_scales[rig_index],
@@ -686,17 +700,20 @@ def run(args: argparse.Namespace) -> int:
     pointcloud_rng = np.random.default_rng(42)
     pointcloud_bounds = None
     mvt_mode = bool(getattr(policy, "uses_mvt", False))
+    pointcloud_views: tuple[str, ...] = ()
     if pointcloud_mode:
+        pointcloud_views = pointcloud_views_for_policy(policy)
         if args.pointcloud_num_points is None:
             args.pointcloud_num_points = int(getattr(policy, "pointcloud_max_points", 4096))
         if args.pointcloud_num_points <= 0:
             raise ValueError("--pointcloud-num-points must be positive")
         calibration = json.loads(args.pointcloud_calibration.expanduser().read_text())
-        expected = {
+        serial_by_view = {
             "sideview": args.sideview_serial,
             "frontview": args.frontview_serial,
         }
-        for key, serial in expected.items():
+        for key in pointcloud_views:
+            serial = serial_by_view[key]
             calibrated = str(calibration["cameras"][key].get("serial", ""))
             if calibrated and calibrated != serial:
                 raise ValueError(f"{key} calibration serial {calibrated} != live serial {serial}")
@@ -725,7 +742,7 @@ def run(args: argparse.Namespace) -> int:
         cameras = RealSenseRig(
             args.sideview_serial, args.wrist_serial, args.frontview_serial,
             fps=30, enable_depth=pointcloud_mode,
-            enabled_views=("sideview", "frontview") if pointcloud_mode else rgb_keys,
+            enabled_views=pointcloud_views if pointcloud_mode else rgb_keys,
         )
         samples = max(1, round(args.stream_hz / args.policy_hz))
         if args.execute:
@@ -791,6 +808,7 @@ def run(args: argparse.Namespace) -> int:
                         camera_data, cameras, calibration, state["q"], client.get_gripper_width(),
                         T_observation, args.pointcloud_num_points, pointcloud_bounds, pointcloud_rng,
                         mvt_mode=mvt_mode, axis_length=float(getattr(policy, "axis_length", 0.04)),
+                        pointcloud_views=pointcloud_views,
                     ))
                 else:
                     side, wrist, front = camera_data
@@ -828,6 +846,7 @@ def run(args: argparse.Namespace) -> int:
                         camera_data, cameras, calibration, state["q"], width, T_observation,
                         args.pointcloud_num_points, pointcloud_bounds, pointcloud_rng,
                         mvt_mode=mvt_mode, axis_length=float(getattr(policy, "axis_length", 0.04)),
+                        pointcloud_views=pointcloud_views,
                     ))
                     policy_obs = stack_pointcloud_observations(history, args.device)
                 else:

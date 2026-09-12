@@ -1,13 +1,13 @@
 # PlanARP v2: sparse-plan chunk followed by autoregressive two-action chunks.
 # Standalone experiment config; no inherited experiment defaults.
 # Stop after 5 epochs; retain v1's 266-epoch LR schedule for comparison.
-name: threading_combined_80_mvt_planarp_v2
+name: threading_combined_80_mvt_cam1_planarp_v2
 _target_: pushbox.workspace.PushBoxARPWorkspace
 task:
-  name: threading_combined_80_mvt_planarp
+  name: threading_combined_80_mvt_cam1_planarp
   dataset:
     _target_: threading_task.mvt_dataset.ThreadingMVTDataset
-    dataset_path: /home/huiyuan/teleoperation/data/threading_combined_80_mvt_7p5hz.h5
+    dataset_path: /home/huiyuan/teleoperation/data/threading_combined_80_mvt_cam1_7p5hz.h5
     urdf_path: /home/huiyuan/teleoperation/remote_controller/src/remote_controller/assets/panda/panda_arm.urdf
     horizon: 10
     n_obs_steps: 1
@@ -82,6 +82,8 @@ policy:
   action_chunk_size: 2
   predict_gripper: false
   pointcloud_max_points: 65536
+  pointcloud_views:
+  - sideview
 optimizer:
   lr: 0.0008
   betas:
@@ -114,7 +116,7 @@ logging:
   group: threading_real_mvt_planarp
   id: null
   mode: online
-  name: threading_combined_80_mvt_planarp_v2_actionchunk${policy.action_chunk_size}
+  name: threading_combined_80_mvt_cam1_planarp_v2_actionchunk${policy.action_chunk_size}
   tags:
   - threading_real
   - mvt
@@ -122,6 +124,8 @@ logging:
   - coarse_to_fine
   - planarp
   - combined_80
+  - cam1
+  - single_camera
   - 7p5hz
   - v2
   - actionchunk${policy.action_chunk_size}

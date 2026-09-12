@@ -1,7 +1,7 @@
 """Original-style MVT + ViT + ARP policy for real Threading."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
@@ -44,6 +44,7 @@ class ThreadingMVTARPPolicy(BaseImagePolicy):
                  vit_mlp_dim: int = 256, arp_depth: int = 4, dropout: float = 0.1,
                  scene_bounds=(0.15, -0.40, -0.15, 0.75, 0.30, 0.50),
                  num_latents: int = 1, pointcloud_max_points: int = 131072,
+                 pointcloud_views: Sequence[str] = ("sideview", "frontview"),
                  plan_steps: int = 0, reverse_plan: bool = True,
                  action_chunk_size: int = 1, predict_gripper: bool = True) -> None:
         super().__init__()
@@ -64,6 +65,12 @@ class ThreadingMVTARPPolicy(BaseImagePolicy):
         self.pointcloud_max_points = int(pointcloud_max_points)
         if self.pointcloud_max_points <= 0:
             raise ValueError("pointcloud_max_points must be positive")
+        self.pointcloud_views = tuple(pointcloud_views)
+        if not self.pointcloud_views or len(set(self.pointcloud_views)) != len(self.pointcloud_views):
+            raise ValueError("pointcloud_views must contain unique camera names")
+        unsupported_views = set(self.pointcloud_views) - {"sideview", "frontview"}
+        if unsupported_views:
+            raise ValueError(f"unsupported pointcloud views: {sorted(unsupported_views)}")
         self.axis_length = 0.04
         self.rgb_keys: tuple[str, ...] = ()
         self.image_size, self.patch_size, self.hidden_dim = image_size, patch_size, hidden_dim

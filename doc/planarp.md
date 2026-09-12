@@ -74,7 +74,34 @@ validates every half epoch and saves every epoch, with W&B online logging.
 python scripts/arp/train.py --config-name=threading_combined_80_mvt_planarp_v2
 ```
 
-Run outputs are grouped under `outputs/threading_combined_80_mvt_planarp_v2/`.
+The cam1 configuration writes runs under
+`outputs/threading_combined_80_mvt_cam1_planarp_v2/`.
+
+### Cam1-only point clouds
+
+Rebuild the same 80 episodes and 7.5 Hz samples from cam1/sideview only. The
+existing fused HDF5 supplies the exact frame selection, state, and actions; the
+command writes a new file and never overwrites the fused dataset.
+
+```bash
+cd /home/huiyuan/teleoperation
+conda run -n pushbox python threading_real/scripts/data/rebuild_mvt_single_camera.py \
+  data/threading_combined_80_mvt_7p5hz.h5 \
+  data/threading_combined_80_mvt_cam1_7p5hz.h5 \
+  --raw-root data/threading_new \
+  --calibration threading_real/calibration/block_grasp_spatial.json \
+  --camera-file cam1.mp4 --calibration-key sideview --camera-column 0
+```
+
+The v2 config points to this dataset and stores `pointcloud_views: [sideview]`
+in the policy. Consequently, Cartesian deployment of its checkpoint starts only
+the cam1/sideview RealSense pipeline.
+
+```bash
+cd /home/huiyuan/teleoperation/threading_real
+conda run -n pushbox python scripts/arp/train.py \
+  --config-name=threading_combined_80_mvt_planarp_v2
+```
 
 ## Deployment
 

@@ -8,6 +8,7 @@ import pty
 import select
 import sys
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -58,6 +59,15 @@ def test_synchronous_execution_is_default() -> None:
     assert parser.parse_args(["checkpoint", "--no-synchronous"]).synchronous is False
     assert parser.parse_args(["checkpoint", "--no-grasp-before-inference"]).grasp_before_inference is False
     assert parser.parse_args(["checkpoint", "--episodes", "10"]).episodes == 10
+
+
+def test_pointcloud_views_follow_checkpoint_metadata() -> None:
+    assert runner.pointcloud_views_for_policy(SimpleNamespace(pointcloud_views=("sideview",))) == (
+        "sideview",
+    )
+    assert runner.pointcloud_views_for_policy(SimpleNamespace()) == ("sideview", "frontview")
+    with pytest.raises(ValueError, match="unsupported checkpoint pointcloud views"):
+        runner.pointcloud_views_for_policy(SimpleNamespace(pointcloud_views=("wrist",)))
 
 
 def test_auto_detects_pi05_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
