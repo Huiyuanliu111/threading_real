@@ -1,0 +1,140 @@
+# PlanARP v2: sparse-plan chunk followed by autoregressive two-action chunks.
+# Standalone experiment config; no inherited experiment defaults.
+# Stop after 5 epochs; retain v1's 266-epoch LR schedule for comparison.
+name: threading_combined_80_mvt_planarp_v2
+_target_: pushbox.workspace.PushBoxARPWorkspace
+task:
+  name: threading_combined_80_mvt_planarp
+  dataset:
+    _target_: threading_task.mvt_dataset.ThreadingMVTDataset
+    dataset_path: /home/huiyuan/teleoperation/data/threading_combined_80_mvt_7p5hz.h5
+    urdf_path: /home/huiyuan/teleoperation/remote_controller/src/remote_controller/assets/panda/panda_arm.urdf
+    horizon: 10
+    n_obs_steps: 1
+    val_ratio: 0.2
+    seed: 42
+    axis_length: 0.04
+  shape_meta:
+    action:
+      shape:
+      - 7
+    obs:
+      points:
+        shape:
+        - 65536
+        - 3
+        type: low_dim
+      colors:
+        shape:
+        - 65536
+        - 3
+        type: low_dim
+      valid_points:
+        shape:
+        - 1
+        type: low_dim
+      agent_pos:
+        shape:
+        - 8
+        type: low_dim
+      control_points:
+        shape:
+        - 3
+        - 3
+        type: low_dim
+dataloader:
+  batch_size: 2
+  num_workers: 4
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+  shuffle: true
+val_dataloader:
+  batch_size: 2
+  num_workers: 2
+  persistent_workers: true
+  pin_memory: true
+  prefetch_factor: 2
+  shuffle: false
+policy:
+  _target_: threading_task.mvt_arp_policy.ThreadingMVTARPPolicy
+  horizon: 10
+  n_action_steps: 5
+  n_obs_steps: 1
+  image_size: 420
+  patch_size: 14
+  hidden_dim: 128
+  vit_depth: 8
+  vit_heads: 8
+  vit_mlp_dim: 256
+  arp_depth: 4
+  dropout: 0.1
+  scene_bounds:
+  - 0.15
+  - -0.4
+  - -0.15
+  - 0.75
+  - 0.3
+  - 0.5
+  num_latents: 1
+  plan_steps: 4
+  reverse_plan: true
+  action_chunk_size: 2
+  predict_gripper: false
+  pointcloud_max_points: 65536
+optimizer:
+  lr: 0.0008
+  betas:
+  - 0.9
+  - 0.999
+  transformer_weight_decay: 0.0001
+training:
+  device: cuda:0
+  seed: 42
+  debug: false
+  resume: false
+  resume_optimizer: true
+  resume_path: null
+  use_ema: false
+  lr_scheduler: cosine
+  lr_num_cycles: 1
+  lr_warmup_steps: 1000
+  gradient_accumulate_every: 8
+  num_epochs: 266
+  stop_at_epoch: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+  val_every: 0.5
+  sample_every: 1000
+  checkpoint_every: 1
+logging:
+  project: adaptive_chunk
+  entity: huiyuan_tac
+  group: threading_real_mvt_planarp
+  id: null
+  mode: online
+  name: threading_combined_80_mvt_planarp_v2_actionchunk${policy.action_chunk_size}
+  tags:
+  - threading_real
+  - mvt
+  - arp
+  - coarse_to_fine
+  - planarp
+  - combined_80
+  - 7p5hz
+  - v2
+  - actionchunk${policy.action_chunk_size}
+  - nogripper
+  - 5epochs
+checkpoint:
+  save_last_ckpt: true
+  save_last_snapshot: false
+  topk:
+    format_str: epoch={epoch:04d}-val_loss={val_loss:.3f}.ckpt
+    k: 3
+    mode: min
+    monitor_key: val_loss
+hydra:
+  run:
+    dir: outputs/${name}/${now:%Y%m%d_%H%M%S}

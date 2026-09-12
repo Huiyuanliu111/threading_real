@@ -61,6 +61,21 @@ The original config and old checkpoints still use `plan_steps=0` and
 `action_chunk_size=1`. To compare with timestep-by-timestep dense decoding while
 keeping the plan, override `policy.action_chunk_size=1`.
 
+## V2: autoregressive dense actions
+
+`pushbox/configs/threading_combined_80_mvt_planarp_v2.yaml` is a standalone
+experiment configuration. Relative to the five-epoch v1 run, the policy change
+is `action_chunk_size: 2`: generate the four sparse guides as one chunk, then
+decode ten dense poses in five autoregressive groups of two. Dataset, split, optimizer and
+learning-rate schedule match v1. Training stops after five completed epochs,
+validates every half epoch and saves every epoch, with W&B online logging.
+
+```bash
+python scripts/arp/train.py --config-name=threading_combined_80_mvt_planarp_v2
+```
+
+Run outputs are grouped under `outputs/threading_combined_80_mvt_planarp_v2/`.
+
 ## Deployment
 
 Use `scripts/deployment/cartesian.py` with `--weights model --policy-hz 7.5`
