@@ -60,3 +60,12 @@ Use a fresh training run: the plan head and larger chunk embedding add parameter
 The original config and old checkpoints still use `plan_steps=0` and
 `action_chunk_size=1`. To compare with timestep-by-timestep dense decoding while
 keeping the plan, override `policy.action_chunk_size=1`.
+
+## Deployment
+
+Use `scripts/deployment/cartesian.py` with `--weights model --policy-hz 7.5`
+for the combined dataset checkpoint. The runner defaults to the remote
+controller RPC URL `http://10.157.175.22:8008/RPC2`, command destination
+`10.157.175.22`, and local UDP state receiver `10.157.175.211`, matching the
+documented lab network. These can be overridden with `--server-url`,
+`--server-ip`, and `--udp-ip`. Start the remote controller server first.

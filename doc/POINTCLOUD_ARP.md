@@ -31,6 +31,12 @@ After training, manually move the robot to the grasp pose and deploy without
 `--move-to-training-start`. The runner closes the gripper before its first
 observation and uses only the calibrated side/front RGB-D cameras:
 
+The Cartesian runner defaults to the follower controller at
+`http://10.157.175.22:8008/RPC2`, TrackC destination `10.157.175.22`, and local
+state receiver `10.157.175.211`. Start the controller server on the follower
+before deployment. Override `--server-url`, `--server-ip`, and `--udp-ip` when
+using a different network setup.
+
 ```bash
 conda run -n pushbox python scripts/deployment/cartesian.py \
   /path/to/checkpoint.ckpt --weights model --policy-hz 6 --execute-steps 10 \

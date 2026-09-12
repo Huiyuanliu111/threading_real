@@ -475,9 +475,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--task", default="pick up the block")
     parser.add_argument("--weights", choices=("ema", "model"), default="ema")
-    parser.add_argument("--server-url", default="http://localhost:8008/RPC2")
-    parser.add_argument("--server-ip", default="127.0.0.1")
-    parser.add_argument("--udp-ip", default="127.0.0.1")
+    # Lab topology documented in doc/old/THREADING_REAL.md: the controller
+    # runs on the follower, while this workstation receives state over UDP.
+    parser.add_argument("--server-url", default="http://10.157.175.22:8008/RPC2",
+                        help="controller XML-RPC URL (default: http://10.157.175.22:8008/RPC2)")
+    parser.add_argument("--server-ip", default="10.157.175.22",
+                        help="TrackC command destination (default: 10.157.175.22)")
+    parser.add_argument("--udp-ip", default="10.157.175.211",
+                        help="local state receiver address (default: 10.157.175.211)")
     parser.add_argument("--udp-port", type=int, default=9000)
     parser.add_argument("--command-port", type=int, default=9200)
     parser.add_argument("--udp-frequency", type=int, default=500)
