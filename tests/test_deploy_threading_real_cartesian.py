@@ -25,7 +25,9 @@ def test_synchronous_execution_is_default() -> None:
     defaults = parser.parse_args(["checkpoint"])
     assert defaults.synchronous is True
     assert defaults.episodes == 1
+    assert defaults.grasp_before_inference is True
     assert parser.parse_args(["checkpoint", "--no-synchronous"]).synchronous is False
+    assert parser.parse_args(["checkpoint", "--no-grasp-before-inference"]).grasp_before_inference is False
     assert parser.parse_args(["checkpoint", "--episodes", "10"]).episodes == 10
 
 

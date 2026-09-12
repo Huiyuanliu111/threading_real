@@ -35,6 +35,7 @@ from scripts.deployment.joint import (  # noqa: E402
     make_observation,
     stack_observations,
 )
+from scripts.deployment.endpoint_schedule import EndpointExecutionSchedule
 def _live_rays(intrinsic: dict[str, float]) -> np.ndarray:
     u, v = np.meshgrid(np.arange(int(intrinsic["width"])), np.arange(int(intrinsic["height"])))
     return np.stack((
@@ -499,14 +500,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="number of predicted deltas executed before replanning; start real tests with 1",
     )
+    parser.add_argument(
+        "--execution-schedule", type=Path,
+        help="MVT endpoint-based execution YAML; overrides fixed --execute-steps",
+    )
     parser.add_argument("--max-cycles", type=int, default=0)
     parser.add_argument(
         "--episodes",
         type=int,
         default=1,
         help=(
-            "number of episodes to run without reloading the policy; values above 1 enable "
-            "Enter-to-end/manual-reset/Enter-to-start interaction"
+            "number of episodes to run without reloading the policy; every episode waits "
+            "for Enter to start and can be ended with Enter"
         ),
     )
     parser.add_argument(
@@ -570,8 +575,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gripper-epsilon", type=float, default=0.01)
     parser.add_argument(
         "--grasp-before-inference",
-        action="store_true",
-        help="close the gripper at the current manually positioned pose before camera warmup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "close the gripper at the current manually positioned pose before camera warmup "
+            "during real execution (default: enabled)"
+        ),
     )
     parser.add_argument(
         "--initial-grasp-width",
@@ -592,8 +601,6 @@ def run(args: argparse.Namespace) -> int:
         raise ImportError("Cartesian deployment requires pinocchio; install it in pushbox with `conda install -c conda-forge pinocchio`") from exc
     if args.execute != args.confirm_real_robot:
         raise ValueError("real execution requires both --execute and --confirm-real-robot")
-    if args.grasp_before_inference and not args.execute:
-        raise ValueError("--grasp-before-inference requires real execution")
     if args.episodes < 1:
         raise ValueError("--episodes must be at least 1")
     if not 0.0 < args.initial_grasp_width <= 0.08:
@@ -637,11 +644,19 @@ def run(args: argparse.Namespace) -> int:
     if args.execute_steps <= 0 or args.execute_steps > int(policy.horizon):
         raise ValueError("--execute-steps must be in [1, checkpoint horizon]")
     adaptive_pi05 = isinstance(policy, PI05DeploymentPolicy) and policy.adaptive
-    max_period = (policy.horizon if adaptive_pi05 else args.execute_steps) / args.policy_hz
+    execution_schedule = None
+    if args.execution_schedule is not None:
+        if not getattr(policy, "uses_mvt", False):
+            raise ValueError("--execution-schedule currently requires an MVT point-cloud policy")
+        execution_schedule = EndpointExecutionSchedule.from_file(args.execution_schedule)
+        if execution_schedule.coarse_steps > int(policy.horizon):
+            raise ValueError("execution schedule coarse_steps exceeds checkpoint horizon")
+    max_execution_steps = execution_schedule.coarse_steps if execution_schedule else args.execute_steps
+    max_period = (policy.horizon if adaptive_pi05 else max_execution_steps) / args.policy_hz
     if args.synchronous and args.sync_timeout <= max_period:
         raise ValueError("--sync-timeout must exceed the maximum executed chunk / policy_hz")
     if not adaptive_pi05:
-        policy.n_action_steps = args.execute_steps
+        policy.n_action_steps = max_execution_steps
     if hasattr(policy, "set_prediction_mode"):
         policy.set_prediction_mode(args.prediction_mode)
     if args.chunk_selector is not None and not adaptive_pi05:
@@ -707,7 +722,10 @@ def run(args: argparse.Namespace) -> int:
         if args.execute:
             streamer = client.create_trackc_streamer(command_ip=args.server_ip, command_port=args.command_port, stream_hz=args.stream_hz, samples_per_segment=samples)
         execution_text = "selector[4,10]" if adaptive_pi05 else str(args.execute_steps)
-        interactive = args.episodes > 1
+        if execution_schedule:
+            execution_text = f"endpoint[{execution_schedule.coarse_steps}->{execution_schedule.fine_steps}]"
+            print(f"[runner] endpoint_xyz_m={execution_schedule.endpoint_xyz_m.tolist()} "
+                  f"fine_radius_m={execution_schedule.fine_radius_m}; fine mode stays active until episode reset")
         print(
             f"[runner] policy loaded; mode={'EXECUTE' if args.execute else 'DRY-RUN'} "
             f"synchronous={args.synchronous} episodes={args.episodes} "
@@ -718,19 +736,20 @@ def run(args: argparse.Namespace) -> int:
         for episode in range(1, args.episodes + 1):
             if stop:
                 break
-            if interactive:
-                prompt = (
-                    f"[episode {episode}/{args.episodes}] Model is loaded. Press Enter to start."
-                    if episode == 1
-                    else f"[episode {episode}/{args.episodes}] Reset the scene, then press Enter to start."
-                )
-                if not wait_for_episode_enter(prompt, lambda: stop):
-                    break
+            if execution_schedule:
+                execution_schedule.reset()
+            prompt = (
+                f"[episode {episode}/{args.episodes}] Model is loaded. Press Enter to start."
+                if episode == 1
+                else f"[episode {episode}/{args.episodes}] Reset the scene, then press Enter to start."
+            )
+            if not wait_for_episode_enter(prompt, lambda: stop):
+                break
 
             reset_target = getattr(policy, "model", policy)
             if hasattr(reset_target, "reset"):
                 reset_target.reset()
-            if args.grasp_before_inference:
+            if args.execute and args.grasp_before_inference:
                 result = client.grasp(
                     args.initial_grasp_width,
                     args.gripper_speed,
@@ -777,7 +796,18 @@ def run(args: argparse.Namespace) -> int:
 
             cycle = 0
             next_cycle = time.monotonic()
-            while not stop:
+            episode_stop = False
+
+            def episode_stop_requested() -> bool:
+                nonlocal episode_stop
+                if not episode_stop and episode_end_requested():
+                    episode_stop = True
+                    print(f"[episode {episode}/{args.episodes}] End requested.")
+                return stop or episode_stop
+
+            while not stop and not episode_stop:
+                if episode_stop_requested():
+                    break
                 camera_data = cameras.read_rgbd(args.camera_timeout_ms) if pointcloud_mode else cameras.read(args.camera_timeout_ms)
                 state, info = client.get_latest_state(allow_stale=False)
                 if state is None: raise RuntimeError(f"fresh robot state unavailable: {info}")
@@ -796,6 +826,10 @@ def run(args: argparse.Namespace) -> int:
                     history.append(make_observation(side, wrist, front, state["q"], width, args.image_size, args.pre_resize_image_size, tcp_position=T_observation[:3, 3]))
                     policy_obs = stack_observations(history, args.device, rgb_keys=rgb_keys)
                 with torch.inference_mode(): raw = policy.predict_action(policy_obs)["action"][0].detach().cpu().numpy()
+                # Inference itself is synchronous, so consume an Enter pressed while it
+                # was running before sending any newly predicted command to the robot.
+                if episode_stop_requested():
+                    break
                 prediction_diagnostics = getattr(policy, "last_prediction_diagnostics", None)
                 raw_translation = np.linalg.norm(raw[:, :3], axis=1)
                 raw_rotation = np.linalg.norm(raw[:, 3:6], axis=1)
@@ -815,6 +849,11 @@ def run(args: argparse.Namespace) -> int:
                     )
                 T_now = client.get_tcp_pose_from_q(robot_model, state["q"], frame_name="panda_hand_tcp")
                 poses, widths, stats = integrate_cartesian_delta_chunk(raw, T_now, width, max_first_translation=args.max_first_translation, max_step_translation=args.max_step_translation, max_first_rotation=args.max_first_rotation, max_step_rotation=args.max_step_rotation, workspace_min=workspace_min, workspace_max=workspace_max)
+                execution_diagnostics = {}
+                if execution_schedule:
+                    steps, execution_diagnostics = execution_schedule.select(T_now[:3, 3], poses)
+                    execution_diagnostics["predicted_action_count"] = len(raw)
+                    raw, poses, widths = raw[:steps], poses[:steps], widths[:steps]
                 sync_result = None
                 if streamer is not None:
                     streamer.update_waypoints(poses, merge_mode="replace")
@@ -830,7 +869,7 @@ def run(args: argparse.Namespace) -> int:
                             timeout=args.sync_timeout,
                             settle_samples=args.sync_settle_samples,
                             poll_hz=args.sync_poll_hz,
-                            stop_requested=lambda: stop,
+                            stop_requested=episode_stop_requested,
                         )
                         if sync_result["stopped"]:
                             break
@@ -843,6 +882,7 @@ def run(args: argparse.Namespace) -> int:
                         "executed": bool(args.execute),
                         "action_count": int(len(raw)),
                         **(prediction_diagnostics or {}),
+                        **execution_diagnostics,
                     }
                     with args.trace_output.open("a") as trace_file:
                         trace_file.write(json.dumps(trace_record) + "\n")
@@ -874,9 +914,13 @@ def run(args: argparse.Namespace) -> int:
                         f" infer={prediction_diagnostics['total_seconds'] * 1000:.1f}ms"
                         f" action={prediction_diagnostics['action_seconds'] * 1000:.1f}ms"
                     )
-                print(f"[runner] episode={episode} cycle={cycle} state_age={info['age']:.4f}s raw_dxyz={stats['raw_first_translation']*1000:.2f}mm safe_dxyz={stats['safe_first_translation']*1000:.2f}mm raw_drot={np.degrees(stats['raw_first_rotation']):.2f}deg gripper={widths[-1]:.4f}m{prediction_text}{spatial_text}{sync_text}")
-                if interactive and episode_end_requested():
-                    print(f"[episode {episode}/{args.episodes}] End requested.")
+                execution_text = ""
+                if execution_diagnostics:
+                    execution_text = (f" phase={execution_diagnostics['execution_phase']}"
+                                      f" execute_steps={len(raw)}"
+                                      f" endpoint_distance={execution_diagnostics['endpoint_distance_m'] * 1000:.1f}mm")
+                print(f"[runner] episode={episode} cycle={cycle} state_age={info['age']:.4f}s raw_dxyz={stats['raw_first_translation']*1000:.2f}mm safe_dxyz={stats['safe_first_translation']*1000:.2f}mm raw_drot={np.degrees(stats['raw_first_rotation']):.2f}deg gripper={widths[-1]:.4f}m{prediction_text}{spatial_text}{execution_text}{sync_text}")
+                if episode_stop_requested():
                     break
                 if args.max_cycles > 0 and cycle >= args.max_cycles:
                     print(f"[episode {episode}/{args.episodes}] Reached max_cycles={args.max_cycles}.")
@@ -901,8 +945,6 @@ def run(args: argparse.Namespace) -> int:
                     "does not enable freedrive."
                 )
             print(f"[episode {episode}/{args.episodes}] Finished after {cycle} cycles.")
-            if not interactive:
-                break
         return 0
     finally:
         if streamer is not None: streamer.close()

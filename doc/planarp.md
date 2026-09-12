@@ -84,3 +84,45 @@ controller RPC URL `http://10.157.175.22:8008/RPC2`, command destination
 `10.157.175.22`, and local UDP state receiver `10.157.175.211`, matching the
 documented lab network. These can be overridden with `--server-url`,
 `--server-ip`, and `--udp-ip`. Start the remote controller server first.
+
+### Execute 10 steps far away, 3 near the demonstration endpoint
+
+```bash
+LD_LIBRARY_PATH=/home/huiyuan/miniconda3/envs/pushbox/lib \
+/home/huiyuan/miniconda3/envs/pushbox/bin/python scripts/deployment/cartesian.py \
+  /path/to/checkpoint.ckpt --weights model --policy-hz 7.5 \
+  --execution-schedule calibration/threading_combined_80_execution.yaml \
+  --trace-output outputs/planarp_execution_trace.jsonl \
+  --synchronous --execute --confirm-real-robot
+```
+
+The schedule overrides fixed `--execute-steps`, requests ten actions from the
+policy regardless of the checkpoint's saved `n_action_steps`, and selects the
+execution prefix without changing the model's internal action chunk size.
+Existing raw-action, rotation and workspace guards still check the whole
+candidate chunk before selecting a prefix.
+
+The reference TCP endpoint is `[0.460892, -0.192691, 0.054059]` m in
+`panda_link0`, using the coordinatewise median of the final measured TCP
+positions from all 80 episodes. This is a deployment reference estimated from
+the whole demonstration set, not a held-out validation metric or a hole pose.
+The p95 endpoint spread is 20.6 mm, with a maximum of 29.7 mm. A configurable
+60 mm radius is an initial execution threshold, not a measured contact boundary.
+
+Fine mode is entered when the current TCP is within this radius or the clipped
+predicted Cartesian path intersects the region, including between waypoints.
+The latter shortens the prefix before a long chunk can cross into the region.
+Fine mode remains active until the next episode starts. Console and trace logs
+report the phase, selected step count and endpoint distance. All ten candidates
+are still generated in fine mode; this changes feedback timing, not inference
+cost. The schedule neither moves directly to the reference point nor declares
+insertion success. If the fixture or grasp configuration changes, rebuild the
+reference from matching demonstrations and adjust the radius.
+
+Regenerate the local schedule from data:
+
+```bash
+python scripts/calibration/build_execution_schedule.py \
+  ../data/threading_combined_80_mvt_7p5hz.h5 \
+  --output calibration/threading_combined_80_execution.yaml
+```

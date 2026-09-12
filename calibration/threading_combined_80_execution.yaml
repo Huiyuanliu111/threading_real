@@ -1,0 +1,19 @@
+frame: panda_link0
+tcp_frame: panda_hand_tcp
+endpoint_xyz_m:
+- 0.4608918646515984
+- -0.1926907640247966
+- 0.054058844756720556
+fine_radius_m: 0.06
+coarse_steps: 10
+fine_steps: 3
+source:
+  dataset: /home/huiyuan/teleoperation/data/threading_combined_80_mvt_7p5hz.h5
+  urdf: /home/huiyuan/teleoperation/remote_controller/src/remote_controller/assets/panda/panda_arm.urdf
+  episodes: 80
+  fps: 7.5
+  method: coordinatewise median of FK(final measured joint state) across all episodes
+  endpoint_spread_m:
+    median: 0.011709937045770672
+    p95: 0.020627617786808407
+    max: 0.029733077007157615
