@@ -21,11 +21,11 @@ def line():
 def test_fit_spatial_rule_and_soft_boundary(task, split, fine_start):
     rule = SpatialRule.fit([line(), line()], task=task, split_progress=split)
     probabilities, expected, _ = rule.label(line())
-    assert expected[0] == (3 if fine_start else 10)
-    assert expected[-1] == (10 if fine_start else 3)
+    assert expected[0] == (4 if fine_start else 10)
+    assert expected[-1] == (10 if fine_start else 4)
     np.testing.assert_allclose(probabilities[round(split * 100)], [.5, .5], atol=1e-6)
     np.testing.assert_allclose(probabilities.sum(1), 1)
-    np.testing.assert_allclose(probabilities @ [3, 10], expected)
+    np.testing.assert_allclose(probabilities @ [4, 10], expected)
     np.testing.assert_allclose(rule.boundary_radius_m, split if fine_start else 1 - split)
 
 
@@ -48,7 +48,7 @@ def test_same_position_same_probability_after_reentry_and_all_integer_outputs():
     distances = np.linspace(radius - .01, radius + .01, 701)
     xyz = np.column_stack((1 - distances, np.zeros((len(distances), 2))))
     expected = rule.label(xyz)[1]
-    assert set(np.floor(expected + .5)) == set(range(3, 11))
+    assert set(np.floor(expected + .5)) == set(range(4, 11))
 
 
 def test_spatial_manifest_controls_training_split(tmp_path):
@@ -166,7 +166,7 @@ def test_feature_cache_and_training_cli_use_spatial_probabilities(tmp_path, monk
     config = json.loads((output / 'chunk_selector_config.json').read_text())
     assert config['selection_mode'] == 'expected'
     assert config['metadata']['training_targets'] == 'explicit_probabilities'
-    assert config['candidate_chunks'] == [3, 10]
+    assert config['candidate_chunks'] == [4, 10]
 
 
 def test_report_uses_recorded_camera_frame_indices(tmp_path):

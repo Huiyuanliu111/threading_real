@@ -19,7 +19,7 @@ from chunk_selector.mvt_data import read_trajectories
 from chunk_selector.spatial_rule import SpatialRule, trajectory_progress
 
 
-def create_labels(dataset, output, *, task, urdf=None, h=3, split_progress=None,
+def create_labels(dataset, output, *, task, urdf=None, h=4, split_progress=None,
                   progress_mode="arc_length", transition_width_m=.02, val_ratio=.2, seed=42):
     dataset, output = Path(dataset).expanduser().resolve(), Path(output).expanduser().resolve()
     if output.exists():
@@ -81,7 +81,7 @@ def main():
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--task", choices=("threading", "maze"), required=True)
-    parser.add_argument("--h", type=int, choices=(3, 4, 5), default=3)
+    parser.add_argument("--h", type=int, choices=(3, 4, 5), default=4)
     parser.add_argument("--split-progress", type=float, help="default: threading .8, maze .3")
     parser.add_argument("--progress-mode", choices=("arc_length", "frames"), default="arc_length")
     parser.add_argument("--transition-width-m", type=float, default=.02,

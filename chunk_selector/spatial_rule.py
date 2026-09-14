@@ -26,7 +26,7 @@ class SpatialRule:
     center_xyz_m: tuple[float, float, float]
     boundary_radius_m: float
     transition_width_m: float = 0.02
-    h: int = 3
+    h: int = 4
     H: int = 10
     split_progress: float = 0.8
     progress_mode: str = "arc_length"
@@ -48,7 +48,7 @@ class SpatialRule:
 
     @classmethod
     def fit(cls, trajectories, *, task, split_progress=None, progress_mode="arc_length",
-            transition_width_m=0.02, h=3):
+            transition_width_m=0.02, h=4):
         """Fit a shared sphere using only the supplied training episodes.
 
         Median start/end XYZ is the center. Median distance of interpolated

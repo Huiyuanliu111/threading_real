@@ -114,15 +114,15 @@ def main():
         obs = {key: value.unsqueeze(0).to(device) for key, value in sample["obs"].items()}
         visual = policy._visual(obs)
         episode, frame = dataset.sample_indices[index]
-        for h in args.requested_steps:
-            for boundary in ("complete_policy", "cached_visual_plan_and_action"):
+        for h_index, h in enumerate(args.requested_steps):
+            for boundary_index, boundary in enumerate(("complete_policy", "cached_visual_plan_and_action")):
                 kwargs = {} if boundary == "complete_policy" else {"visual_features": visual}
                 # Warm up each measured shape and both modes before the first sample.
                 if sample_number == 0:
                     for _ in range(args.warmup):
                         for mode in MODES:
                             policy.predict_action(obs, prediction_mode=mode, requested_steps=h, **kwargs)
-                order = MODES if pair_index % 2 == 0 else MODES[::-1]
+                order = MODES if (sample_number + h_index + boundary_index) % 2 == 0 else MODES[::-1]
                 predictions, timing, diagnostics = {}, {}, {}
                 for mode in order:
                     prediction, measurement = timed_call(

@@ -476,9 +476,13 @@ def episode_end_requested() -> bool:
     return True
 
 
+from threading_real.episode_results import EpisodeResults
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Deploy a Cartesian-delta ThreadingReal checkpoint via TrackC")
     parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("--results-csv", type=Path, help="CSV filename for timed evaluation; resume numbering when the file exists")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--policy-kind", choices=("auto", "pushbox", "smolvla", "pi05"), default="auto")
     parser.add_argument(
@@ -490,7 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--prediction-mode",
         choices=("required_only", "full_then_truncate"),
         default="full_then_truncate",
-        help="generate only selected steps, or generate 10 and execute the selected prefix",
+        help="generate selected steps (MVT rounds up to complete action groups), or generate the full horizon and execute the selected prefix",
     )
     parser.add_argument(
         "--trace-output",
@@ -617,6 +621,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
+    results = (EpisodeResults(args.results_csv, task="threading",
+                              condition="selector" if args.chunk_selector else "no_selector",
+                              executed=args.execute) if args.results_csv else None)
     from remote_controller.RemoteControllerClient import RemoteControllerClient
     try:
         from remote_controller.robot_kinematics import RobotModel
@@ -830,6 +837,8 @@ def run(args: argparse.Namespace) -> int:
                 print(f"[runner] episode={episode} TrackC UDP target={args.server_ip}:{args.command_port} stream_hz={args.stream_hz}")
             print(f"[episode {episode}/{args.episodes}] Running; press Enter to end this episode.")
 
+            if results:
+                results.start(episode)
             cycle = 0
             next_cycle = time.monotonic()
             episode_stop = False
@@ -838,6 +847,8 @@ def run(args: argparse.Namespace) -> int:
                 nonlocal episode_stop
                 if not episode_stop and episode_end_requested():
                     episode_stop = True
+                    if results:
+                        results.end()
                     print(f"[episode {episode}/{args.episodes}] End requested.")
                 return stop or episode_stop
 
@@ -901,6 +912,19 @@ def run(args: argparse.Namespace) -> int:
                     raw_translation[max_translation_step] > args.abort_translation
                     or raw_rotation[max_rotation_step] > args.abort_rotation
                 ):
+                    if args.trace_output is not None:
+                        with args.trace_output.open("a") as trace_file:
+                            trace_file.write(json.dumps({
+                                "episode": episode, "cycle": cycle + 1,
+                                "timestamp": time.time(),
+                                **mode_diagnostics,
+                                "event": "unsafe_raw_action", "executed": False,
+                                "executed_steps": 0, "checked_steps": len(raw),
+                                "max_translation_m": float(raw_translation[max_translation_step]),
+                                "max_rotation_rad": float(raw_rotation[max_rotation_step]),
+                                "max_translation_step": max_translation_step + 1,
+                                "max_rotation_step": max_rotation_step + 1,
+                            }) + "\n")
                     raise RuntimeError(
                         "unsafe raw Cartesian action in predicted chunk: "
                         f"translation={raw_translation[max_translation_step]:.4f} m "
@@ -1011,6 +1035,8 @@ def run(args: argparse.Namespace) -> int:
                 if remaining > 0: time.sleep(remaining)
                 else: print(f"[runner] warning: inference overran replan period by {-remaining:.3f}s"); next_cycle=time.monotonic()
 
+            if results:
+                results.end("interrupted" if stop else "max_cycles")
             if streamer is not None and streamer.started:
                 streamer.stop()
                 arm_state = client.wait_until_arm_moving_finished(timeout=5.0)
@@ -1023,12 +1049,18 @@ def run(args: argparse.Namespace) -> int:
                     "Use the Franka hand-guiding controls for manual reset; this runner "
                     "does not enable freedrive."
                 )
+            if results and not stop:
+                results.prompt(lambda: stop)
             print(f"[episode {episode}/{args.episodes}] Finished after {cycle} cycles.")
         return 0
     finally:
-        if streamer is not None: streamer.close()
-        if cameras is not None: cameras.close()
-        client.close(); signal.signal(signal.SIGINT, old_int); signal.signal(signal.SIGTERM, old_term)
+        try:
+            if results:
+                results.end("interrupted")
+        finally:
+            if streamer is not None: streamer.close()
+            if cameras is not None: cameras.close()
+            client.close(); signal.signal(signal.SIGINT, old_int); signal.signal(signal.SIGTERM, old_term)
 
 
 def main() -> int:
