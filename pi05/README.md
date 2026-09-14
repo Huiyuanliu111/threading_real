@@ -259,7 +259,7 @@ Enter 结束 episode。任务假定方块已位于夹爪中，`--grasp-before-in
 Selector 与 π0.5 分开训练。先从真实机器人 Cartesian 动作生成 `{4,10}` 的概率标签：
 
 ```bash
-python threading_real/scripts/label_lerobot_tcp_chunks.py \
+python threading_real/scripts/chunk_selector/label_tcp_chunks.py \
   --dataset data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d \
   --output data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d_tcp_chunk_soft_labels_4_10_smoothed \
   --candidate-chunks 4 10 \
@@ -267,11 +267,45 @@ python threading_real/scripts/label_lerobot_tcp_chunks.py \
   --label-smoothing-window 3
 ```
 
+也可以按当前 TCP 到固定端点的距离标注，适合以视觉为输入的 selector。
+从仓库根目录运行（`--dataset` 替换成实际的 Cartesian LeRobot v3 数据路径）：
+
+```bash
+python threading_real/scripts/chunk_selector/label_tcp_chunks.py \
+  --dataset data/threading_lerobot_v3_cartesian \
+  --output data/threading_distance_soft_labels_3_10 \
+  --label-method distance \
+  --endpoint-schedule threading_real/calibration/threading_combined_80_execution.yaml \
+  --candidate-chunks 3 10 \
+  --coarse-radius-m 0.12 \
+  --label-smoothing-window 1
+```
+
+端点和 `fine_radius_m` 来自 schedule YAML，坐标系必须为 `panda_link0` /
+`panda_hand_tcp`；当前 TCP 由测量关节状态经 URDF FK 计算。
+设距离为 `d`，`p_max = clip((d - fine_radius) / (coarse_radius - fine_radius), 0, 1)`，
+则两端概率为 `[1-p_max, p_max]`，连续 chunk 为 `min + p_max*(max-min)`。
+例如半径 6–12 cm、chunk 3–10 时，9 cm 得到 `[0.5, 0.5]` 和 6.5。
+`coarse_radius_m` 默认是 fine 半径的两倍，需大于 fine 半径；chunk 上下限由
+`--candidate-chunks` 指定，独立于 YAML 的执行步数。多个候选值时在相邻 chunk
+数值之间分配概率，保持同样的连续期望值。输出包含 `endpoint_distance_m`，
+`summary.json` 记录端点、半径和标注规则。
+
+距离标签不做全数据排名，也不使用预测路径或进入 fine 后锁定的历史状态，因此同一
+距离对应同一标签。默认不做时间平滑；可通过 `--label-smoothing-window` 开启逐
+episode 概率中值滤波，但这会使标签受相邻帧影响。原有速度法仍为默认，亦可显式
+指定 `--label-method speed`。
+
+距离标签沿用下面的特征提取和训练流程：将 `--labels` 换为新输出的
+`labels.parquet`，特征提取加 `--candidate-chunks 3 10`，使用新的 HDF5 和模型输出路径。
+训练必须指定 `--use-target-probabilities --selection-mode expected`，使网络学习概率、
+推理通过概率期望输出 min–max 内的连续值；实际执行步数四舍五入为整数。
+
 使用训练完成的 π0.5 checkpoint 提取冻结的两相机视觉 token。默认把每路 SigLIP
 token 池化为 `4×4`，每帧共缓存 32 个 token：
 
 ```bash
-python threading_real/pi05/extract_selector_features.py \
+python threading_real/pi05/chunk_selector/extract_features.py \
   --checkpoint threading_real/pi05/outputs/threading_combined_pi05_tcp_pose_6d_v1/checkpoints/last/pretrained_model \
   --dataset-root data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d \
   --labels data/threading_combined_pi05_15hz_sg5_nozero_tcp_pose_6d_tcp_chunk_soft_labels_4_10_smoothed/labels.parquet \
@@ -284,7 +318,7 @@ python threading_real/pi05/extract_selector_features.py \
 `4*p4 + 10*p10` 得到连续 chunk，再四舍五入为 4 到 10 的执行步数：
 
 ```bash
-python threading_real/scripts/train_chunk_selector.py \
+python threading_real/scripts/chunk_selector/train.py \
   data/threading_combined_pi05_selector_soft_4_10.hdf5 \
   --output-dir threading_real/pi05/outputs/selector_soft_4_10 \
   --use-target-probabilities \

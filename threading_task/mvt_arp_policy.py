@@ -1,6 +1,7 @@
 """Original-style MVT + ViT + ARP policy for real Threading."""
 from __future__ import annotations
 
+from numbers import Integral
 from typing import Any, Sequence
 
 import torch
@@ -225,9 +226,30 @@ class ThreadingMVTARPPolicy(BaseImagePolicy):
             contexts={**contexts, "visual-tokens": visual_tokens})
 
     @torch.no_grad()
-    def predict_action(self, obs_dict: dict[str, torch.Tensor]):
+    def predict_action(self, obs_dict: dict[str, torch.Tensor], *, visual_features=None,
+                       prediction_mode: str = "full_then_truncate",
+                       requested_steps: int | None = None):
+        """Generate all plans, then full actions or the complete groups needed.
+
+        ``action_pred`` contains every generated action, while ``action`` is the
+        requested execution prefix. Short generation never splits an ARP group.
+        """
+        if prediction_mode not in {"full_then_truncate", "required_only"}:
+            raise ValueError(f"unsupported prediction_mode: {prediction_mode!r}")
+        requested_steps = self.n_action_steps if requested_steps is None else requested_steps
+        if (isinstance(requested_steps, bool) or not isinstance(requested_steps, Integral)
+                or not 1 <= requested_steps <= self.horizon):
+            raise ValueError("requested_steps must be an integer in [1, horizon]")
+        requested_steps = int(requested_steps)
+        generated_steps = self.horizon
+        if prediction_mode == "required_only":
+            generated_steps = min(self.horizon, (
+                (requested_steps + self.action_chunk_size - 1) // self.action_chunk_size
+            ) * self.action_chunk_size)
         self.eval()
-        _, visual_tokens, encoded = self._visual(obs_dict)
+        _, visual_tokens, encoded = (
+            self._visual(obs_dict) if visual_features is None else visual_features
+        )
         bsz, anchors, views = len(encoded), 3, 2
         current_px = self.renderer.project(self.renderer.to_cube(
             obs_dict["control_points"][:, -1])).reshape(bsz, anchors * views, 2)
@@ -244,7 +266,7 @@ class ThreadingMVTARPPolicy(BaseImagePolicy):
             future.extend([{"tk_id": plan_id, "chk_id": 6}] * (self.plan_steps * 6))
             contexts["plan-featmap"] = self._spatial_features(encoded, self.plan_steps)
         action_start_chunk = anchors * views + bool(self.plan_steps)
-        for step in range(self.horizon):
+        for step in range(generated_steps):
             chunk = action_start_chunk + step // self.action_chunk_size
             future.extend([{"tk_id": target_id, "chk_id": chunk}] * (anchors * views))
             if self.predict_gripper:
@@ -253,14 +275,14 @@ class ThreadingMVTARPPolicy(BaseImagePolicy):
                 # Embedding sees previous actions; the predictor sees the new chunk.
                 feature_context[str(chunk)] = self._spatial_features(encoded, step)
                 predict_context[str(chunk)] = self._spatial_features(
-                    encoded, min(self.action_chunk_size, self.horizon - step))
+                    encoded, min(self.action_chunk_size, generated_steps - step))
         generated = self.policy.generate(prompt, future, sample=False,
             contexts={**contexts, "visual-featmap": feature_context,
                       "action-predict-featmap": predict_context})
         plan_end = anchors * views + self.plan_steps * 6
         produced = generated[:, plan_end:]
         pixels, grippers = [], []
-        for step in range(self.horizon):
+        for step in range(generated_steps):
             block = produced[:, step * self.action_tokens:(step + 1) * self.action_tokens]
             pixels.append(block[:, :6, :2].reshape(bsz, anchors, views, 2))
             if self.predict_gripper:
@@ -273,7 +295,7 @@ class ThreadingMVTARPPolicy(BaseImagePolicy):
         previous_rotation = _rotation_from_control_points(current_control)
         previous_gripper = obs_dict["agent_pos"][:, -1, 7]
         actions = []
-        for step in range(self.horizon):
+        for step in range(generated_steps):
             action = torch.zeros((bsz, 7), device=origins.device)
             action[:, :3] = origins[:, step] - previous_origin
             action[:, 3:6] = _matrix_to_rotvec(rotations[:, step] @ previous_rotation.transpose(-1, -2))
@@ -283,8 +305,18 @@ class ThreadingMVTARPPolicy(BaseImagePolicy):
             actions.append(action)
             previous_origin, previous_rotation = origins[:, step], rotations[:, step]
         prediction = torch.stack(actions, 1)
-        result = {"action_pred": prediction, "action": prediction[:, :self.n_action_steps],
-                  "target_control_points": control}
+        result = {"action_pred": prediction, "action": prediction[:, :requested_steps],
+                  "target_control_points": control,
+                  "prediction_diagnostics": {
+                      "prediction_mode": prediction_mode,
+                      "requested_steps": requested_steps,
+                      "generated_steps": generated_steps,
+                      "plan_token_count": self.plan_steps * 6,
+                      "action_token_count": generated_steps * self.action_tokens,
+                      "generated_action_groups": (
+                          generated_steps + self.action_chunk_size - 1
+                      ) // self.action_chunk_size,
+                  }}
         if self.plan_steps:
             plan_pixels = generated[:, anchors * views:plan_end, :2].reshape(
                 bsz, self.plan_steps, anchors, views, 2)

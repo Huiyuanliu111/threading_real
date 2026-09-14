@@ -484,7 +484,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--chunk-selector",
         type=Path,
-        help="trained pi0.5 chunk selector sidecar; enables adaptive 4-10 step execution",
+        help="trained pi0.5 or MVT ARP chunk selector sidecar",
     )
     parser.add_argument(
         "--prediction-mode",
@@ -667,6 +667,15 @@ def run(args: argparse.Namespace) -> int:
     if args.execute_steps <= 0 or args.execute_steps > int(policy.horizon):
         raise ValueError("--execute-steps must be in [1, checkpoint horizon]")
     adaptive_pi05 = isinstance(policy, PI05DeploymentPolicy) and policy.adaptive
+    mvt_selector = None
+    if args.chunk_selector is not None and not adaptive_pi05:
+        if not getattr(policy, "uses_mvt", False):
+            raise ValueError("--chunk-selector requires pi0.5 or an MVT ARP policy")
+        if args.execution_schedule is not None:
+            raise ValueError("choose either --chunk-selector or --execution-schedule")
+        from chunk_selector.chunk_selector import ChunkSelector
+        mvt_selector = ChunkSelector.from_pretrained(args.chunk_selector, device=args.device).eval()
+        mvt_selector.validate_for_policy(feature_dim=policy.hidden_dim, max_chunk=policy.horizon)
     execution_schedule = None
     if args.execution_schedule is not None:
         if not getattr(policy, "uses_mvt", False):
@@ -675,6 +684,8 @@ def run(args: argparse.Namespace) -> int:
         if execution_schedule.coarse_steps > int(policy.horizon):
             raise ValueError("execution schedule coarse_steps exceeds checkpoint horizon")
     max_execution_steps = execution_schedule.coarse_steps if execution_schedule else args.execute_steps
+    if mvt_selector is not None:
+        max_execution_steps = max(mvt_selector.candidate_chunks)
     max_period = (policy.horizon if adaptive_pi05 else max_execution_steps) / args.policy_hz
     if args.synchronous and args.sync_timeout <= max_period:
         raise ValueError("--sync-timeout must exceed the maximum executed chunk / policy_hz")
@@ -682,8 +693,6 @@ def run(args: argparse.Namespace) -> int:
         policy.n_action_steps = max_execution_steps
     if hasattr(policy, "set_prediction_mode"):
         policy.set_prediction_mode(args.prediction_mode)
-    if args.chunk_selector is not None and not adaptive_pi05:
-        raise ValueError("--chunk-selector is only supported by a pi0.5 policy")
     if args.trace_output is not None:
         args.trace_output = args.trace_output.expanduser().resolve()
         args.trace_output.parent.mkdir(parents=True, exist_ok=True)
@@ -853,12 +862,37 @@ def run(args: argparse.Namespace) -> int:
                     side, wrist, front = camera_data
                     history.append(make_observation(side, wrist, front, state["q"], width, args.image_size, args.pre_resize_image_size, tcp_position=T_observation[:3, 3]))
                     policy_obs = stack_observations(history, args.device, rgb_keys=rgb_keys)
-                with torch.inference_mode(): raw = policy.predict_action(policy_obs)["action"][0].detach().cpu().numpy()
+                mvt_selection = None
+                mode_diagnostics = {}
+                with torch.inference_mode():
+                    if mvt_mode:
+                        from chunk_selector.mvt_features import predict_for_execution
+                        start = time.monotonic()
+                        prediction, mvt_selection = predict_for_execution(
+                            policy, policy_obs, prediction_mode=args.prediction_mode,
+                            execute_steps=args.execute_steps, selector=mvt_selector,
+                            schedule=execution_schedule)
+                        # Check every generated candidate before executing any prefix.
+                        raw = prediction["action_pred"][0].detach().cpu().numpy()
+                        mode_diagnostics = dict(prediction["prediction_diagnostics"])
+                        mode_diagnostics["guard_scope"] = "all_generated_actions"
+                        mode_diagnostics["checked_steps"] = len(raw)
+                        elapsed = time.monotonic() - start
+                    else:
+                        raw = policy.predict_action(policy_obs)["action"][0].detach().cpu().numpy()
                 # Inference itself is synchronous, so consume an Enter pressed while it
                 # was running before sending any newly predicted command to the robot.
                 if episode_stop_requested():
                     break
                 prediction_diagnostics = getattr(policy, "last_prediction_diagnostics", None)
+                if mvt_selection is not None:
+                    prediction_diagnostics = {
+                        "execution_chunk": int(mvt_selection.chunk_sizes[0]),
+                        "predicted_chunk": len(raw),
+                        "continuous_chunk": float(mvt_selection.continuous_chunk_sizes[0]),
+                        "chunk_probabilities": mvt_selection.probabilities[0].tolist(),
+                        "total_seconds": elapsed,
+                    }
                 raw_translation = np.linalg.norm(raw[:, :3], axis=1)
                 raw_rotation = np.linalg.norm(raw[:, 3:6], axis=1)
                 max_translation_step = int(np.argmax(raw_translation))
@@ -873,7 +907,8 @@ def run(args: argparse.Namespace) -> int:
                         f"at step {max_translation_step + 1}/{len(raw)}, "
                         f"rotation={raw_rotation[max_rotation_step]:.4f} rad "
                         f"at step {max_rotation_step + 1}/{len(raw)}; "
-                        f"limits={args.abort_translation:.4f} m/{args.abort_rotation:.4f} rad"
+                        f"limits={args.abort_translation:.4f} m/{args.abort_rotation:.4f} rad; "
+                        f"mode={args.prediction_mode} checked_steps={len(raw)}"
                     )
                 T_now = client.get_tcp_pose_from_q(robot_model, state["q"], frame_name="panda_hand_tcp")
                 poses, widths, stats = integrate_cartesian_delta_chunk(raw, T_now, width, max_first_translation=args.max_first_translation, max_step_translation=args.max_step_translation, max_first_rotation=args.max_first_rotation, max_step_rotation=args.max_step_rotation, workspace_min=workspace_min, workspace_max=workspace_max)
@@ -882,6 +917,15 @@ def run(args: argparse.Namespace) -> int:
                     steps, execution_diagnostics = execution_schedule.select(T_now[:3, 3], poses)
                     execution_diagnostics["predicted_action_count"] = len(raw)
                     raw, poses, widths = raw[:steps], poses[:steps], widths[:steps]
+                if mvt_selection is not None:
+                    steps = int(mvt_selection.chunk_sizes[0])
+                    raw, poses, widths = raw[:steps], poses[:steps], widths[:steps]
+                elif mvt_mode and execution_schedule is None:
+                    steps = args.execute_steps
+                    raw, poses, widths = raw[:steps], poses[:steps], widths[:steps]
+                if mode_diagnostics:
+                    mode_diagnostics["executed_steps"] = len(raw) if args.execute else 0
+                    mode_diagnostics["selected_steps"] = len(raw)
                 sync_result = None
                 if streamer is not None:
                     streamer.update_waypoints(poses, merge_mode="replace")
@@ -911,6 +955,7 @@ def run(args: argparse.Namespace) -> int:
                         "action_count": int(len(raw)),
                         **(prediction_diagnostics or {}),
                         **execution_diagnostics,
+                        **mode_diagnostics,
                     }
                     with args.trace_output.open("a") as trace_file:
                         trace_file.write(json.dumps(trace_record) + "\n")
@@ -934,14 +979,20 @@ def run(args: argparse.Namespace) -> int:
                         f" spatial_ok={trustworthy}"
                     )
                 prediction_text = ""
+                if mode_diagnostics:
+                    prediction_text = (f" mode={mode_diagnostics['prediction_mode']}"
+                                       f" requested={mode_diagnostics['requested_steps']}"
+                                       f" generated={mode_diagnostics['generated_steps']}"
+                                       f" selected={len(raw)}")
                 if prediction_diagnostics:
-                    prediction_text = (
+                    prediction_text += (
                         f" chunk={prediction_diagnostics['execution_chunk']}"
                         f" predicted={prediction_diagnostics['predicted_chunk']}"
                         f" soft={prediction_diagnostics['continuous_chunk']:.2f}"
                         f" infer={prediction_diagnostics['total_seconds'] * 1000:.1f}ms"
-                        f" action={prediction_diagnostics['action_seconds'] * 1000:.1f}ms"
                     )
+                    if "action_seconds" in prediction_diagnostics:
+                        prediction_text += f" action={prediction_diagnostics['action_seconds'] * 1000:.1f}ms"
                 execution_text = ""
                 if execution_diagnostics:
                     execution_text = (f" phase={execution_diagnostics['execution_phase']}"

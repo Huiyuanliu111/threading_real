@@ -198,3 +198,71 @@ def test_disabled_gripper_has_no_loss_or_generation(action_chunk_size):
         assert torch.count_nonzero(result["action_pred"][..., 6]) == 0
     finally:
         handle.remove()
+
+
+@pytest.mark.parametrize("plan_steps,predict_gripper", [(0, True), (4, False)])
+def test_required_only_matches_complete_groups(plan_steps, predict_gripper, monkeypatch):
+    torch.manual_seed(31)
+    model = ThreadingMVTARPPolicy(
+        horizon=5, n_action_steps=3, plan_steps=plan_steps, action_chunk_size=2,
+        predict_gripper=predict_gripper, image_size=28, patch_size=14,
+        hidden_dim=32, vit_mlp_dim=64, vit_depth=1, arp_depth=2, dropout=0).eval()
+    for block in model.policy.blocks:
+        torch.nn.init.constant_(block.adaLN_modulation[-1].bias, 0.1)
+    obs = _plan_batch(horizon=5)["obs"]
+    with torch.no_grad():
+        features = model._visual(obs)
+    default = model.predict_action(obs)
+    keys_before = set(model.state_dict())
+
+    def unexpected_visual(*args):
+        raise AssertionError("cached visual features were not reused")
+
+    monkeypatch.setattr(model, "_visual", unexpected_visual)
+    futures = []
+    generate = model.policy.generate
+
+    def record_generate(prompt, future, **kwargs):
+        futures.append(future)
+        return generate(prompt, future, **kwargs)
+
+    monkeypatch.setattr(model.policy, "generate", record_generate)
+    full = model.predict_action(obs, visual_features=features,
+                                prediction_mode="full_then_truncate")
+    torch.testing.assert_close(full["action_pred"], default["action_pred"], rtol=0, atol=0)
+    for requested, count in [(1, 2), (2, 2), (3, 4), (4, 4), (5, 5)]:
+        short = model.predict_action(obs, visual_features=features,
+                                     prediction_mode="required_only", requested_steps=requested)
+        assert short["action"].shape == (2, requested, 7)
+        assert short["action_pred"].shape == (2, count, 7)
+        for key in ("action_pred", "target_control_points"):
+            torch.testing.assert_close(short[key], full[key][:, :count], rtol=0, atol=0)
+        if plan_steps:
+            torch.testing.assert_close(short["plan_control_points"],
+                                       full["plan_control_points"], rtol=0, atol=0)
+        if not predict_gripper:
+            assert torch.count_nonzero(short["action_pred"][..., 6]) == 0
+        assert len(futures[-1]) == plan_steps * 6 + count * model.action_tokens
+        assert short["prediction_diagnostics"] == {
+            "prediction_mode": "required_only", "requested_steps": requested,
+            "generated_steps": count, "plan_token_count": plan_steps * 6,
+            "action_token_count": count * model.action_tokens,
+            "generated_action_groups": (count + 1) // 2,
+        }
+    assert set(model.state_dict()) == keys_before
+    short_default = model.predict_action(obs, visual_features=features, prediction_mode="required_only")
+    assert short_default["action_pred"].shape[1] == 4
+    assert full["prediction_diagnostics"]["generated_steps"] == 5
+
+
+@pytest.mark.parametrize("requested_steps", [0, -1, 4, True, 1.0, "2"])
+def test_prediction_rejects_invalid_requested_steps(requested_steps):
+    model = _small_model(plan_steps=3)
+    with pytest.raises(ValueError, match="requested_steps"):
+        model.predict_action({}, requested_steps=requested_steps)
+
+
+def test_prediction_rejects_unknown_mode():
+    model = _small_model(plan_steps=3)
+    with pytest.raises(ValueError, match="prediction_mode"):
+        model.predict_action({}, prediction_mode="typo")

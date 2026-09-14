@@ -17,8 +17,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from lerobot.configs.video import RGBEncoderConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+try:
+    from lerobot.configs.video import RGBEncoderConfig
+except ImportError:  # LeRobot 0.4.x configures the codec on create().
+    RGBEncoderConfig = None
 from scipy.spatial.transform import Rotation
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -171,6 +174,11 @@ def convert(
         if state_representation == "joint"
         else UrdfForwardKinematics(urdf_path.expanduser().resolve())
     )
+    encoder_kwargs = (
+        {"vcodec": "libsvtav1"}
+        if RGBEncoderConfig is None
+        else {"rgb_encoder": RGBEncoderConfig(vcodec="libsvtav1", video_backend="pyav")}
+    )
     dst = LeRobotDataset.create(
         repo_id=repo_id,
         root=output,
@@ -179,7 +187,7 @@ def convert(
         features=features,
         use_videos=True,
         video_backend="pyav",
-        rgb_encoder=RGBEncoderConfig(vcodec="libsvtav1", video_backend="pyav"),
+        **encoder_kwargs,
     )
 
     total_frames = 0

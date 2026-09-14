@@ -7,7 +7,7 @@ task:
   name: threading_combined_80_mvt_cam1_planarp
   dataset:
     _target_: threading_task.mvt_dataset.ThreadingMVTDataset
-    dataset_path: /home/huiyuan/teleoperation/data/threading_combined_80_mvt_cam1_7p5hz.h5
+    dataset_path: /home/huiyuan/teleoperation/data/datasets/threading_combined_80_mvt_cam1_7p5hz.h5
     urdf_path: /home/huiyuan/teleoperation/remote_controller/src/remote_controller/assets/panda/panda_arm.urdf
     horizon: 10
     n_obs_steps: 1

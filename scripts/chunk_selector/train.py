@@ -214,7 +214,7 @@ def main() -> int:
     parser.add_argument(
         "--selection-mode",
         choices=("argmax", "expected"),
-        default="argmax",
+        default=None,
         help="map predicted probabilities to a candidate or their expected chunk",
     )
     parser.add_argument(
@@ -241,6 +241,14 @@ def main() -> int:
 
     dataset_path = args.dataset.expanduser().resolve()
     dataset = ChunkFeatureDataset(dataset_path)
+    is_spatial = dataset.metadata.get("label_source") == "spatial_rule"
+    if is_spatial:
+        if args.soft_target_temperature is not None:
+            parser.error("spatial_rule training uses explicit probabilities, not utility targets")
+        if args.selection_mode == "argmax":
+            parser.error("spatial_rule requires expected selection to output all integers in h..H")
+        args.use_target_probabilities = True
+    args.selection_mode = args.selection_mode or ("expected" if is_spatial else "argmax")
     if args.use_target_probabilities:
         with h5py.File(dataset_path, "r") as h5:
             if "target_probabilities" not in h5:

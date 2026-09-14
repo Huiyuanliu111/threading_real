@@ -14,8 +14,10 @@
 π0.5。π0.5 的 `run_required_only.sh` 和 `run_full_then_truncate.sh` 记录每周期时延及人工
 标注的 episode 成功结果，`summarize_trials.py` 汇总两条路径的成功率与推理时间。
 
-当前 adaptive selector 已接入 π0.5 部署；ARP 的 selector 训练工具已保留，但尚未接入
-ARP 实机执行器，因此不能直接用它运行 required-only / full-then-truncate A/B。
+当前 adaptive selector 已接入 π0.5 和 MVT ARP 部署。MVT ARP 使用冻结的点云视觉
+特征训练 Transformer selector，支持基于训练轨迹的 spatial rule soft label；部署复用
+一次 MVT 编码并按概率期望选择整数执行步数，目前支持 full-then-truncate。
+标注、节点视频帧可视化、训练与推理命令见 [Chunk selector](../doc/Chunk_selector.md)。
 
 空间 ARP 的相机标定工具位于 `scripts/calibration/`。历史 PushBox 与 MimicGen Threading
 仿真脚本已移除。

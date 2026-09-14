@@ -1,4 +1,4 @@
-"""TCP-motion pseudo-labels for real-robot adaptive chunk selection.
+"""TCP-motion and endpoint-distance pseudo-labels for real-robot adaptive chunk selection.
 
 The labels intentionally use only signals that can also be observed online:
 current robot state and a short state history.  Future trajectory data is used
@@ -226,3 +226,53 @@ def label_tcp_motion(
     bins = np.minimum((precision_percentile * len(candidates)).astype(np.int64), len(candidates) - 1)
     chunks = np.asarray([candidates[len(candidates) - 1 - item] for item in bins], dtype=np.int64)
     return chunks, score.astype(np.float32)
+
+
+DISTANCE_LABEL_RULE_VERSION = "tcp_endpoint_distance_soft_v1"
+
+
+def distance_chunk_targets(
+    tcp_positions: np.ndarray,
+    *,
+    endpoint_xyz_m: np.ndarray,
+    fine_radius_m: float,
+    coarse_radius_m: float,
+    candidate_chunks: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Map current TCP distance to probabilities and a continuous chunk expectation.
+
+    Inside fine_radius use the minimum chunk, outside coarse_radius use the
+    maximum, and interpolate linearly in metres between them. No episode ranks,
+    future path, or latched history are used. Neighboring candidate probabilities
+    interpolate in chunk *size*, so nonuniform candidates preserve the expectation.
+    Returns probabilities [T,K], expected chunks [T], and distances in metres [T].
+    """
+    positions = np.asarray(tcp_positions, dtype=np.float64)
+    endpoint = np.asarray(endpoint_xyz_m, dtype=np.float64)
+    candidates = np.asarray(candidate_chunks, dtype=np.float64)
+    if (positions.ndim != 2 or positions.shape[1] != 3 or not len(positions)
+            or not np.isfinite(positions).all()):
+        raise ValueError("tcp_positions must be a non-empty finite [T,3] array")
+    if endpoint.shape != (3,) or not np.isfinite(endpoint).all():
+        raise ValueError("endpoint_xyz_m must be a finite XYZ vector")
+    if (not np.isfinite([fine_radius_m, coarse_radius_m]).all()
+            or not 0 < fine_radius_m < coarse_radius_m):
+        raise ValueError("require finite 0 < fine_radius_m < coarse_radius_m")
+    if (candidates.ndim != 1 or len(candidates) < 2
+            or not np.isfinite(candidates).all() or candidates[0] <= 0
+            or np.any(candidates != np.floor(candidates))
+            or np.any(np.diff(candidates) <= 0)):
+        raise ValueError("candidate_chunks must be strictly increasing positive integers")
+    distances = np.linalg.norm(positions - endpoint, axis=1)
+    coarse_probability = np.clip(
+        (distances - fine_radius_m) / (coarse_radius_m - fine_radius_m), 0, 1
+    )
+    expected = candidates[0] + coarse_probability * (candidates[-1] - candidates[0])
+    upper = np.searchsorted(candidates, expected, side="right").clip(1, len(candidates) - 1)
+    lower = upper - 1
+    weight = (expected - candidates[lower]) / (candidates[upper] - candidates[lower])
+    probabilities = np.zeros((len(positions), len(candidates)), dtype=np.float32)
+    rows = np.arange(len(positions))
+    probabilities[rows, lower] = 1 - weight
+    probabilities[rows, upper] = weight
+    return probabilities, expected.astype(np.float32), distances

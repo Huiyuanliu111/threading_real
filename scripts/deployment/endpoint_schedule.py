@@ -47,9 +47,14 @@ class EndpointExecutionSchedule:
         """
         current = np.asarray(current_xyz, dtype=float)
         poses = np.asarray(target_poses, dtype=float)
-        if (current.shape != (3,) or poses.shape != (self.coarse_steps, 4, 4)
+        # Once latched, future path geometry no longer controls the decision.
+        # required-only can therefore supply only the complete groups covering fine_steps.
+        valid_length = (poses.ndim == 3 and poses.shape[1:] == (4, 4)
+                        and (self.fine_steps <= len(poses) <= self.coarse_steps
+                             if self.fine_mode else len(poses) == self.coarse_steps))
+        if (current.shape != (3,) or not valid_length
                 or not np.isfinite(current).all() or not np.isfinite(poses).all()):
-            raise ValueError("schedule requires a finite current XYZ and full coarse pose chunk")
+            raise ValueError("schedule requires finite poses: full coarse chunk before fine mode, at least fine_steps after")
         path = np.concatenate((current[None], poses[:, :3, 3]))
         start, delta = path[:-1], np.diff(path, axis=0)
         length2 = (delta * delta).sum(axis=1)

@@ -87,7 +87,7 @@ command writes a new file and never overwrites the fused dataset.
 cd /home/huiyuan/teleoperation
 conda run -n pushbox python threading_real/scripts/data/rebuild_mvt_single_camera.py \
   data/threading_combined_80_mvt_7p5hz.h5 \
-  data/threading_combined_80_mvt_cam1_7p5hz.h5 \
+  data/datasets/threading_combined_80_mvt_cam1_7p5hz.h5 \
   --raw-root data/threading_new \
   --calibration threading_real/calibration/block_grasp_spatial.json \
   --camera-file cam1.mp4 --calibration-key sideview --camera-column 0

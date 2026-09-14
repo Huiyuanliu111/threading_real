@@ -504,6 +504,17 @@ def episode_split_indices(
         raise ValueError("val_ratio must lie strictly between 0 and 1")
     with h5py.File(Path(path).expanduser().resolve(), "r") as h5:
         episode_ids = np.asarray(h5["episode_ids"].asstr()[:])
+        metadata = json.loads(h5.attrs.get("metadata", "{}"))
+    if metadata.get("label_source") == "spatial_rule":
+        # Preserve the split used to fit the rule: validation geometry must never
+        # influence a boundary later evaluated on those same validation episodes.
+        train = set(metadata["fit_episode_ids"])
+        validation = set(metadata["validation_episode_ids"])
+        if (not train or not validation or train & validation
+                or train | validation != set(episode_ids)):
+            raise ValueError("invalid spatial-rule train/validation episode manifest")
+        return (np.flatnonzero(np.isin(episode_ids, list(train))),
+                np.flatnonzero(np.isin(episode_ids, list(validation))))
     unique_episodes = np.unique(episode_ids)
     if len(unique_episodes) < 2:
         raise ValueError("At least two distinct episodes are required for a split")

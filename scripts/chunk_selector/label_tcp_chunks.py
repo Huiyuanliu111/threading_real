@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Create auditable TCP-motion chunk-size pseudo-labels from Cartesian LeRobot v3.
+"""Create auditable TCP-motion or endpoint-distance chunk-size pseudo-labels from Cartesian LeRobot v3.
 
 The output is a separate Parquet label table: it does not alter the LeRobot
 dataset. Use it as supervision when extracting visual features for a chunk
-selector. Labels map slow/complex TCP motion to short action chunks.
+selector. Labels map slow/complex TCP motion or proximity to a fixed endpoint
+to short action chunks.
 """
 from __future__ import annotations
 
@@ -21,8 +22,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from convert_lerobot_v3_to_cartesian import UrdfForwardKinematics
+from scripts.deployment.endpoint_schedule import EndpointExecutionSchedule
 from threading_task.tcp_chunk_labels import (
     LABEL_RULE_VERSION,
+    DISTANCE_LABEL_RULE_VERSION,
+    distance_chunk_targets,
     label_tcp_motion,
     smooth_chunk_labels,
     smooth_chunk_probabilities,
@@ -54,7 +58,27 @@ def create_labels(
     smoothing_window: int,
     label_smoothing_window: int,
     direction_speed_floor_mps: float,
+    label_method: str = "speed",
+    endpoint_schedule: Path | None = None,
+    coarse_radius_m: float | None = None,
 ) -> dict:
+    if label_method not in {"speed", "distance"}:
+        raise ValueError("label_method must be speed or distance")
+    schedule = None
+    if label_method == "distance":
+        if endpoint_schedule is None:
+            raise ValueError("distance labels require endpoint_schedule")
+        schedule = EndpointExecutionSchedule.from_file(endpoint_schedule)
+        if coarse_radius_m is None:
+            coarse_radius_m = 2 * schedule.fine_radius_m
+        # Validate configuration before reading the dataset or running FK.
+        distance_chunk_targets(
+            np.zeros((1, 3)), endpoint_xyz_m=schedule.endpoint_xyz_m,
+            fine_radius_m=schedule.fine_radius_m, coarse_radius_m=coarse_radius_m,
+            candidate_chunks=candidate_chunks,
+        )
+    elif endpoint_schedule is not None or coarse_radius_m is not None:
+        raise ValueError("endpoint_schedule and coarse_radius_m require distance labels")
     dataset = dataset.resolve()
     output = output.resolve()
     if output.exists():
@@ -107,27 +131,42 @@ def create_labels(
         for name, values in episode_metrics.items():
             metric_columns[name][rows] = values
 
-    raw_chunks, precision_score = label_tcp_motion(
-        metric_columns, candidate_chunks=candidate_chunks
-    )
-    target_probabilities, _ = soft_chunk_targets(
-        precision_score,
-        candidate_chunks=candidate_chunks,
-    )
+    distance_columns = {}
+    if schedule is None:
+        raw_chunks, precision_score = label_tcp_motion(
+            metric_columns, candidate_chunks=candidate_chunks
+        )
+        target_probabilities, _ = soft_chunk_targets(
+            precision_score, candidate_chunks=candidate_chunks,
+        )
+    else:
+        target_probabilities, expected, distances = distance_chunk_targets(
+            tcp_positions, endpoint_xyz_m=schedule.endpoint_xyz_m,
+            fine_radius_m=schedule.fine_radius_m, coarse_radius_m=coarse_radius_m,
+            candidate_chunks=candidate_chunks,
+        )
+        raw_chunks = np.asarray(candidate_chunks)[target_probabilities.argmax(axis=1)]
+        precision_score = 1 - (expected - candidate_chunks[0]) / (
+            candidate_chunks[-1] - candidate_chunks[0]
+        )
+        distance_columns["endpoint_distance_m"] = distances
     chunks = raw_chunks.copy()
     raw_transitions = 0
     smoothed_transitions = 0
     for episode in np.unique(episode_indices):
         rows = np.flatnonzero(episode_indices == episode)
         rows = rows[np.argsort(frame_indices[rows], kind="stable")]
-        chunks[rows] = smooth_chunk_labels(
-            raw_chunks[rows], candidate_chunks=candidate_chunks,
-            window=label_smoothing_window,
-        )
+        if schedule is None:
+            chunks[rows] = smooth_chunk_labels(
+                raw_chunks[rows], candidate_chunks=candidate_chunks,
+                window=label_smoothing_window,
+            )
         target_probabilities[rows] = smooth_chunk_probabilities(
             target_probabilities[rows],
             window=label_smoothing_window,
         )
+        if schedule is not None:
+            chunks[rows] = np.asarray(candidate_chunks)[target_probabilities[rows].argmax(axis=1)]
         raw_transitions += int(np.count_nonzero(np.diff(raw_chunks[rows])))
         smoothed_transitions += int(np.count_nonzero(np.diff(chunks[rows])))
     soft_chunk_size = target_probabilities @ np.asarray(candidate_chunks, dtype=np.float32)
@@ -148,6 +187,7 @@ def create_labels(
             "tcp_y_m": pa.array(tcp_positions[:, 1]),
             "tcp_z_m": pa.array(tcp_positions[:, 2]),
             **{name: pa.array(values) for name, values in metric_columns.items()},
+            **{name: pa.array(values) for name, values in distance_columns.items()},
         }
     )
     pq.write_table(labels, output / "labels.parquet", compression="zstd")
@@ -202,6 +242,21 @@ def create_labels(
         "chunk_counts": {str(chunk): chunk_counts.get(chunk, 0) for chunk in candidate_chunks},
         "episodes": episode_summary,
     }
+    summary["label_method"] = label_method
+    if schedule is not None:
+        summary.update({
+            "label_rule_version": DISTANCE_LABEL_RULE_VERSION,
+            "frame": "panda_link0",
+            "endpoint_schedule": str(endpoint_schedule.expanduser().resolve()),
+            "endpoint_xyz_m": schedule.endpoint_xyz_m.tolist(),
+            "fine_radius_m": schedule.fine_radius_m,
+            "coarse_radius_m": coarse_radius_m,
+            "score": "1 - clip((distance - fine_radius) / (coarse_radius - fine_radius), 0, 1)",
+            "label_mapping": "argmax of smoothed distance probabilities; ties prefer shorter chunk",
+            "soft_label_mapping": "linear distance-to-chunk mapping, interpolated between neighboring chunk sizes",
+            "history_latch": False,
+        })
+        summary["label_smoothing"]["method"] = "per_episode_probability_median_filter_then_argmax"
     (output / "summary.json").write_text(json.dumps(_jsonable(summary), indent=2) + "\n")
     return summary
 
@@ -223,6 +278,11 @@ def main() -> int:
         type=Path,
         default=Path("remote_controller/src/remote_controller/assets/panda/panda_arm.urdf"),
     )
+    parser.add_argument("--label-method", choices=("speed", "distance"), default="speed")
+    parser.add_argument("--endpoint-schedule", type=Path,
+                        help="execution schedule YAML with endpoint and fine radius; required for distance")
+    parser.add_argument("--coarse-radius-m", type=float,
+                        help="distance where maximum chunk is reached; defaults to twice fine radius")
     parser.add_argument("--candidate-chunks", type=int, nargs="+", default=[1, 2, 4, 8, 20])
     parser.add_argument("--smoothing-window", type=int, default=5)
     parser.add_argument("--label-smoothing-window", type=int, default=1,
@@ -245,6 +305,9 @@ def main() -> int:
         smoothing_window=args.smoothing_window,
         label_smoothing_window=args.label_smoothing_window,
         direction_speed_floor_mps=args.direction_speed_floor_mps,
+        label_method=args.label_method,
+        endpoint_schedule=args.endpoint_schedule,
+        coarse_radius_m=args.coarse_radius_m,
     )
     print(json.dumps({"output": str(args.output.resolve()), "chunk_counts": summary["chunk_counts"]}, indent=2))
     return 0
