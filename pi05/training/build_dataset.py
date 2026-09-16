@@ -14,6 +14,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DATA_ROOT = REPO_ROOT / "data"
 DEFAULT_DATASET_NAME = "threading_combined_pi05_15hz_sg5_continuous_tcp_pose_6d"
 DEFAULT_REPO_ID = f"threading_real/{DEFAULT_DATASET_NAME}"
+sys.path.insert(0, str(REPO_ROOT))
+from threading_real.pi05.visual.crop import load as load_visual, save as save_visual, METADATA_FILE
 
 
 def run(command: list[str]) -> None:
@@ -53,6 +55,7 @@ def main() -> int:
     parser.add_argument("--expected-episodes", type=int, default=80)
     parser.add_argument("--source-fps", type=int, default=30)
     parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--visual-config", type=Path, help="fixed raw-image cam1/cam3 crop configuration")
     parser.add_argument("--action-stride", type=int, default=2)
     parser.add_argument("--chunk-size", type=int, default=10)
     parser.add_argument("--smooth-window", type=int, default=5)
@@ -77,6 +80,9 @@ def main() -> int:
     )
     parser.add_argument("--keep-intermediates", action="store_true")
     args = parser.parse_args()
+    visual_config = load_visual(args.visual_config) if args.visual_config else None
+    if visual_config and args.image_size != visual_config["output_size"]:
+        raise ValueError("--visual-config requires --image-size 224")
 
     for name in ("expected_episodes", "source_fps", "image_size", "action_stride", "chunk_size"):
         if int(getattr(args, name)) < 1:
@@ -96,19 +102,25 @@ def main() -> int:
         raise FileExistsError("refusing to overwrite pipeline outputs: " + ", ".join(existing))
 
     episode_count = 0
+    completed = False
     try:
         episode_count = stage_raw_roots(args.raw_root, stage)
         if episode_count != args.expected_episodes:
             raise ValueError(
                 f"expected {args.expected_episodes} raw episodes, found {episode_count}"
             )
-        run([
-            sys.executable, "convert_vla_to_lerobot_v3.py", str(stage), str(joint),
+        converter = ("threading_real/pi05/training/convert_raw_cropped.py"
+                     if visual_config else "convert_vla_to_lerobot_v3.py")
+        conversion_command = [
+            sys.executable, converter, str(stage), str(joint),
             "--repo-id", args.repo_id,
             "--task", args.task,
             "--fps", str(args.source_fps),
             "--image-size", str(args.image_size), "--skip-depth",
-        ])
+        ]
+        if visual_config:
+            conversion_command.extend(["--visual-config", str(args.visual_config.expanduser().resolve())])
+        run(conversion_command)
         run([
             sys.executable, "convert_lerobot_v3_to_cartesian.py",
             str(joint), str(cartesian), "--urdf", str(args.urdf),
@@ -132,6 +144,8 @@ def main() -> int:
         if args.drop_zero_actions:
             prepare_command.append("--drop-zero-actions")
         run(prepare_command)
+        if visual_config:
+            save_visual(visual_config, output / "meta" / METADATA_FILE)
         run([
             sys.executable, "threading_real/pi05/training/preflight.py",
             "--dataset-root", str(output), "--repo-id", args.repo_id,
@@ -149,6 +163,7 @@ def main() -> int:
             "source_fps": args.source_fps,
             "fps": expected_fps,
             "image_size": args.image_size,
+            "visual_preprocessing": visual_config,
             "action_stride": args.action_stride,
             "chunk_size": args.chunk_size,
             "smooth_window": args.smooth_window,
@@ -170,9 +185,10 @@ def main() -> int:
             json.dumps(summary, indent=2, ensure_ascii=False) + "\n"
         )
         print(json.dumps(summary, indent=2, ensure_ascii=False))
+        completed = True
     finally:
         shutil.rmtree(stage, ignore_errors=True)
-        if not args.keep_intermediates and output.exists():
+        if not args.keep_intermediates and completed:
             for path in (joint, cartesian, stride):
                 shutil.rmtree(path, ignore_errors=True)
     return 0

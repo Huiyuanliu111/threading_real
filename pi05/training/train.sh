@@ -5,7 +5,7 @@ set -euo pipefail
 # Override variables on the command line, e.g. STEPS=10 ./train.sh.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PI05_DIR=$(cd "${SCRIPT_DIR}/.." && pwd)
-if [[ -d "${PI05_DIR}/../../data/threading_combined_pi05_15hz_sg5_continuous_tcp_pose_6d" ]]; then
+if [[ -f "${PI05_DIR}/../../convert_vla_to_lerobot_v3.py" ]]; then
   PROJECT_ROOT=$(cd "${PI05_DIR}/../.." && pwd)
 else
   PROJECT_ROOT=$(cd "${PI05_DIR}/.." && pwd)
@@ -272,6 +272,7 @@ export PI05_HIGH_NOISE_FRACTION="${HIGH_NOISE_FRACTION}"
 export PI05_HIGH_NOISE_MIN_TIME="${HIGH_NOISE_MIN_TIME}"
 export PI05_FIXED_EVAL_SEED="${FIXED_EVAL_SEED}"
 export PI05_STATE_REPRESENTATION="${STATE_REPRESENTATION}"
+export PI05_DATASET_ROOT="${DATASET_ROOT}"
 
 exec torchrun --standalone --nproc-per-node="${NUM_PROCESSES}" \
   "${SCRIPT_DIR}/train_with_state_dropout.py" \

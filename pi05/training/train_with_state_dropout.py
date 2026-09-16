@@ -6,10 +6,13 @@ from __future__ import annotations
 import os
 import runpy
 import json
+import sys
 from pathlib import Path
 
 import torch
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy, PI05Pytorch
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from pi05.visual.crop import load as load_visual, save as save_visual, METADATA_FILE
 
 
 # PaliGemma tokenizer IDs for the exact separators emitted by
@@ -166,6 +169,15 @@ def drop_state_prompt_tokens(
 
 
 def main() -> None:
+    # Read once, before training; each checkpoint carries the exact dataset preprocessing.
+    dataset_root = os.environ.get("PI05_DATASET_ROOT")
+    for argument in sys.argv[1:]:
+        if argument.startswith("--dataset.root="):
+            dataset_root = argument.split("=", 1)[1]
+    if "--dataset.root" in sys.argv:
+        dataset_root = sys.argv[sys.argv.index("--dataset.root") + 1]
+    visual_path = Path(dataset_root).expanduser() / "meta" / METADATA_FILE if dataset_root else None
+    visual_config = load_visual(visual_path) if visual_path and visual_path.exists() else None
     probability = float(os.environ.get("PI05_PROPRIO_DROPOUT", "0"))
     if not 0.0 <= probability < 1.0:
         raise ValueError("PI05_PROPRIO_DROPOUT must be in [0, 1)")
@@ -252,6 +264,8 @@ def main() -> None:
         }
         path = Path(save_directory) / STATE_METADATA_FILE
         path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        if visual_config:
+            save_visual(visual_config, Path(save_directory) / METADATA_FILE)
         return result
 
     def sample_time_with_high_noise_mixture(self, bsize, device):

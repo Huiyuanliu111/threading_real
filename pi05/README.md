@@ -3,6 +3,11 @@
 本目录使用 Hugging Face LeRobot 的 π0.5 实现和 `lerobot/pi05_base` 权重，
 训练任务为 `insert the grasped block through the needle`。
 
+固定任务区域裁剪实验见 [visual/README.md](visual/README.md)：从原始 cam1/cam3
+视频选框、预览、重建数据、训练，以及读取 checkpoint 裁剪配置的实机入口。
+该实验保留原 SigLIP 和两路输入，默认使用连续 15 Hz 数据。下文部分旧示例仍使用
+迁移前路径和 `nozero` 数据；裁剪实验请使用新文档中的命令。
+
 ## 数据
 
 最终数据集默认位于：
