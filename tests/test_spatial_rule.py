@@ -147,6 +147,7 @@ def test_feature_cache_and_training_cli_use_spatial_probabilities(tmp_path, monk
             return None, torch.ones(len(obs['points']), 8, 4), None
 
     monkeypatch.setattr(extraction, 'load_mvt_policy', lambda *args: FrozenPolicy())
+    (tmp_path / 'checkpoint').write_bytes(b'test checkpoint')
     cache = tmp_path / 'features.h5'
     relocated_source = tmp_path / 'relocated_maze.h5'
     source.rename(relocated_source)

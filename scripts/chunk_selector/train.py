@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import random
 import sys
@@ -222,6 +223,10 @@ def main() -> int:
         action="store_true",
         help="disable inverse-frequency class weighting",
     )
+    parser.add_argument("--wandb-mode", choices=("disabled", "offline", "online"), default="disabled")
+    parser.add_argument("--wandb-project", default="chunk-selector")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-name", default=None)
     args = parser.parse_args()
 
     if args.epochs <= 0 or args.batch_size <= 0 or args.patience <= 0:
@@ -241,12 +246,12 @@ def main() -> int:
 
     dataset_path = args.dataset.expanduser().resolve()
     dataset = ChunkFeatureDataset(dataset_path)
-    is_spatial = dataset.metadata.get("label_source") == "spatial_rule"
+    is_spatial = dataset.metadata.get("label_source") in {"spatial_rule", "progress_rule"}
     if is_spatial:
         if args.soft_target_temperature is not None:
-            parser.error("spatial_rule training uses explicit probabilities, not utility targets")
+            parser.error("rule-based training uses explicit probabilities, not utility targets")
         if args.selection_mode == "argmax":
-            parser.error("spatial_rule requires expected selection to output all integers in h..H")
+            parser.error("rule-based supervision requires expected selection to output all integers in h..H")
         args.use_target_probabilities = True
     args.selection_mode = args.selection_mode or ("expected" if is_spatial else "argmax")
     if args.use_target_probabilities:
@@ -323,73 +328,115 @@ def main() -> int:
         weights = weights / weights.mean()
         class_weights = torch.as_tensor(weights, device=device, dtype=torch.float32)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    history: list[dict[str, Any]] = []
-    best_score = -float("inf")
-    best_epoch = 0
-    epochs_without_improvement = 0
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = _run_epoch(
-            model,
-            train_loader,
-            device=device,
-            optimizer=optimizer,
-            class_weights=class_weights,
-            soft_target_temperature=args.soft_target_temperature,
-            use_target_probabilities=args.use_target_probabilities,
+    run = None
+    if args.wandb_mode != "disabled":
+        import wandb
+        run = wandb.init(
+            project=args.wandb_project, entity=args.wandb_entity,
+            name=args.wandb_name or args.output_dir.name,
+            mode=args.wandb_mode, dir=str(args.output_dir.resolve()),
+            config={
+                **{key: str(value) if isinstance(value, Path) else value
+                   for key, value in vars(args).items()},
+                "selector_config": asdict(config),
+                "train_frames": len(train_indices), "validation_frames": len(val_indices),
+            },
         )
-        val_metrics = _run_epoch(
-            model,
-            val_loader,
-            device=device,
-            optimizer=None,
-            class_weights=class_weights,
-            soft_target_temperature=args.soft_target_temperature,
-            use_target_probabilities=args.use_target_probabilities,
-        )
-        record = {"epoch": epoch, "train": train_metrics, "validation": val_metrics}
-        history.append(record)
-        print(
-            f"epoch={epoch:03d} "
-            f"train_loss={train_metrics['loss']:.4f} "
-            f"val_loss={val_metrics['loss']:.4f} "
-            f"val_acc={val_metrics['accuracy']:.3f} "
-            f"val_macro_f1={val_metrics['macro_f1']:.3f}"
-            + (
-                f" val_chunk_mae={val_metrics['chunk_mae']:.3f}"
-                if "chunk_mae" in val_metrics
-                else ""
+        if args.wandb_mode == "online" and run.settings.mode != "online":
+            raise RuntimeError("W&B did not enter requested online mode")
+        run.define_metric("epoch")
+        run.define_metric("train/*", step_metric="epoch")
+        run.define_metric("validation/*", step_metric="epoch")
+        (args.output_dir / "wandb_run.json").write_text(json.dumps({
+            "id": run.id, "url": run.url, "project": run.project,
+            "entity": run.entity, "mode": run.settings.mode,
+        }, indent=2) + "\n")
+        print(f"W&B run: {run.url}", flush=True)
+    try:
+        history: list[dict[str, Any]] = []
+        best_score = -float("inf")
+        best_epoch = 0
+        epochs_without_improvement = 0
+        for epoch in range(1, args.epochs + 1):
+            train_metrics = _run_epoch(
+                model,
+                train_loader,
+                device=device,
+                optimizer=optimizer,
+                class_weights=class_weights,
+                soft_target_temperature=args.soft_target_temperature,
+                use_target_probabilities=args.use_target_probabilities,
             )
-        )
-        score = (
-            -val_metrics["loss"]
-            if args.use_target_probabilities
-            else val_metrics["macro_f1"]
-        )
-        if score > best_score:
-            best_score = score
-            best_epoch = epoch
-            epochs_without_improvement = 0
-            model.eval()
-            model.save_pretrained(
-                args.output_dir,
-                metadata={
-                    "best_epoch": str(epoch),
-                    "best_validation_loss": str(val_metrics["loss"]),
-                    "best_validation_macro_f1": str(val_metrics["macro_f1"]),
-                },
+            val_metrics = _run_epoch(
+                model,
+                val_loader,
+                device=device,
+                optimizer=None,
+                class_weights=class_weights,
+                soft_target_temperature=args.soft_target_temperature,
+                use_target_probabilities=args.use_target_probabilities,
             )
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= args.patience:
-                print(f"early stopping after {epoch} epochs")
-                break
+            record = {"epoch": epoch, "train": train_metrics, "validation": val_metrics}
+            history.append(record)
+            if run is not None:
+                run.log({"epoch": epoch,
+                         **{f"train/{k}": v for k, v in train_metrics.items()},
+                         **{f"validation/{k}": v for k, v in val_metrics.items()}})
+            (args.output_dir / "training_history.json").write_text(json.dumps(history, indent=2) + "\n")
+            print(
+                f"epoch={epoch:03d} "
+                f"train_loss={train_metrics['loss']:.4f} "
+                f"val_loss={val_metrics['loss']:.4f} "
+                f"val_acc={val_metrics['accuracy']:.3f} "
+                f"val_macro_f1={val_metrics['macro_f1']:.3f}"
+                + (
+                    f" val_chunk_mae={val_metrics['chunk_mae']:.3f}"
+                    if "chunk_mae" in val_metrics
+                    else ""
+                )
+            )
+            score = (
+                -val_metrics["loss"]
+                if args.use_target_probabilities
+                else val_metrics["macro_f1"]
+            )
+            if score > best_score:
+                best_score = score
+                best_epoch = epoch
+                if run is not None:
+                    run.summary.update({"best_epoch": epoch,
+                                        "best_validation_loss": val_metrics["loss"],
+                                        "best_validation_macro_f1": val_metrics["macro_f1"],
+                                        "best_validation_chunk_mae": val_metrics.get("chunk_mae")})
+                epochs_without_improvement = 0
+                model.eval()
+                model.save_pretrained(
+                    args.output_dir,
+                    metadata={
+                        "best_epoch": str(epoch),
+                        "best_validation_loss": str(val_metrics["loss"]),
+                        "best_validation_macro_f1": str(val_metrics["macro_f1"]),
+                    },
+                )
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= args.patience:
+                    print(f"early stopping after {epoch} epochs")
+                    break
 
-    (args.output_dir / "training_history.json").write_text(
-        json.dumps(history, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    print(f"best epoch={best_epoch}")
-    print(f"selector saved to {args.output_dir.resolve()}")
+        (args.output_dir / "training_history.json").write_text(
+            json.dumps(history, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"best epoch={best_epoch}")
+        print(f"selector saved to {args.output_dir.resolve()}")
+    except BaseException:
+        if run is not None:
+            run.finish(exit_code=1)
+        raise
+    else:
+        if run is not None:
+            run.finish()
     return 0
 
 

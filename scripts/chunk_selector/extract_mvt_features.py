@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -81,8 +82,8 @@ def extract(checkpoint, labels_dir, output, *, device="cpu", weights="model",
     if output.exists():
         raise FileExistsError(f"refusing to overwrite {output}")
     summary = json.loads((labels_dir / "summary.json").read_text())
-    if summary.get("label_source") != "spatial_rule":
-        raise ValueError("expected spatial_rule label metadata")
+    if summary.get("label_source") not in {"spatial_rule", "progress_rule"}:
+        raise ValueError("expected spatial_rule or progress_rule label metadata")
     candidates = tuple(summary["candidate_chunks"])
     labels = pq.read_table(labels_dir / "labels.parquet").to_pandas()
     probabilities = labels[[f"chunk_probability_{n}" for n in candidates]].to_numpy(np.float32)
@@ -107,9 +108,10 @@ def extract(checkpoint, labels_dir, output, *, device="cpu", weights="model",
             if writer is None:
                 writer = ChunkFeatureWriter(output, feature_shape=tuple(tokens.shape[1:]),
                     candidate_chunks=candidates, metadata={
-                        "label_source": "spatial_rule", "spatial_rule": summary["rule"],
+                        "label_source": summary["label_source"], summary["label_source"]: summary["rule"],
                         "source_dataset": str(source_dataset),
                         "source_checkpoint": str(Path(checkpoint).resolve()), "weights": weights,
+                        "source_checkpoint_sha256": hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest(),
                         "source_labels": str(labels_dir), "mvt_pool_grid": pool_grid,
                         "fit_episode_ids": summary["fit_episode_ids"],
                         "validation_episode_ids": summary["validation_episode_ids"],

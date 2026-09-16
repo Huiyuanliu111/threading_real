@@ -505,7 +505,7 @@ def episode_split_indices(
     with h5py.File(Path(path).expanduser().resolve(), "r") as h5:
         episode_ids = np.asarray(h5["episode_ids"].asstr()[:])
         metadata = json.loads(h5.attrs.get("metadata", "{}"))
-    if metadata.get("label_source") == "spatial_rule":
+    if metadata.get("label_source") in {"spatial_rule", "progress_rule"}:
         # Preserve the split used to fit the rule: validation geometry must never
         # influence a boundary later evaluated on those same validation episodes.
         train = set(metadata["fit_episode_ids"])
