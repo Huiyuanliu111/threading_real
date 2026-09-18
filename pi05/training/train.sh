@@ -275,7 +275,7 @@ export PI05_STATE_REPRESENTATION="${STATE_REPRESENTATION}"
 export PI05_DATASET_ROOT="${DATASET_ROOT}"
 
 exec torchrun --standalone --nproc-per-node="${NUM_PROCESSES}" \
-  "${SCRIPT_DIR}/train_with_state_dropout.py" \
+  "${TRAIN_ENTRYPOINT:-${SCRIPT_DIR}/train_with_state_dropout.py}" \
   --dataset.repo_id="${REPO_ID}" \
   --dataset.root="${DATASET_ROOT}" \
   --dataset.video_backend=pyav \
