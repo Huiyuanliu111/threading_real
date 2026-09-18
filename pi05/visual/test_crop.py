@@ -123,19 +123,24 @@ def test_pipeline_passes_config_and_keeps_failed_intermediates(config, tmp_path,
 def test_deployment_loads_checkpoint_config_and_restores_hooks(config, tmp_path, monkeypatch):
     from threading_real.pi05.deployment import cropped
     save(config, tmp_path / "visual_preprocessing.json")
-    (tmp_path / "config.json").write_text(json.dumps({"type": "pi05"}))
+    (tmp_path / "config.json").write_text(json.dumps({"type": "pi05", "input_features": {
+        "observation.state": {"shape": [8]}}}))
+    (tmp_path / "state_representation.json").write_text(json.dumps({
+        "state_representation": "joint", "state_dim": 8}))
     args = argparse.Namespace(checkpoint=tmp_path, policy_kind="auto", image_size=None,
                               pre_resize_image_size=None, chunk_selector=None)
     runner = types.ModuleType("threading_real.scripts.deployment.cartesian")
     runner.build_parser = lambda: types.SimpleNamespace(parse_args=lambda: args)
-    original_observe = lambda *a, **k: a
+    import torch
+    original_observe = lambda *a, **k: types.SimpleNamespace(
+        images=a, agent_pos=torch.tensor([*a[3], a[4]], dtype=torch.float32))
     original_rig = lambda *a, **k: k
     runner.make_observation, runner.RealSenseRig = original_observe, original_rig
     def main():
         assert runner.RealSenseRig(fps=30) == {"fps": 30, "width": 640, "height": 480}
         raw = np.zeros((480, 640, 3), np.uint8)
         obs = runner.make_observation(raw, None, raw, [0] * 7, 0.02, 224)
-        assert obs[0].shape == (224, 224, 3)
+        assert obs.images[0].shape == (224, 224, 3)
         return 0
     runner.main = main
     monkeypatch.setitem(sys.modules, runner.__name__, runner)

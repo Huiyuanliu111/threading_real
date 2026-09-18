@@ -6,6 +6,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from threading_real.pi05.visual.crop import load, make_observation_adapter, METADATA_FILE
+from threading_real.pi05.deployment.state import make_state_adapter
 
 
 def main():
@@ -29,7 +30,8 @@ def main():
     def configured_rig(*positional, **kwargs):
         kwargs.update(width=width, height=height)
         return original_rig(*positional, **kwargs)
-    cartesian.make_observation = make_observation_adapter(original, config)
+    adapted = make_state_adapter(make_observation_adapter(original, config), args.checkpoint)
+    cartesian.make_observation = adapted
     cartesian.RealSenseRig = configured_rig
     print(f"[crop] checkpoint ROIs: {config['cameras']}; letterbox to 224px", flush=True)
     try:
