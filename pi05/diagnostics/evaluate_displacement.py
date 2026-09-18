@@ -321,6 +321,14 @@ def main() -> None:
             targets.append(batch["action"].numpy())
             episodes.append(batch["episode_index"].numpy())
             frames.append(batch["frame_index"].numpy())
+            # Match lerobot_train._preprocess_dataset_batch: return_uint8=True
+            # saves worker memory, but the saved VISUAL=IDENTITY processor does
+            # not convert 0..255 pixels to the 0..1 range expected by SigLIP.
+            for key in policy.config.image_features:
+                if batch[key].dtype == torch.uint8:
+                    batch[key] = batch[key].to(torch.float32) / 255.0
+                if not torch.isfinite(batch[key]).all() or batch[key].min() < 0 or batch[key].max() > 1:
+                    raise ValueError(f"{key}: expected finite RGB values in [0, 1]")
             processed = preprocess(batch)
             inference_started = time.perf_counter()
             prediction = postprocess(policy.predict_action_chunk(processed))
