@@ -35,7 +35,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["pushbox*", "threading_task*", "chunk_selector*", "pi05*"]
+include = ["pushbox*", "threading_task*", "chunk_selector*", "pi05*", "AAC*"]
 
 [tool.black]
 line-length = 100

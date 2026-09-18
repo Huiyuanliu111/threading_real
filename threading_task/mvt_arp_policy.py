@@ -228,7 +228,7 @@ class ThreadingMVTARPPolicy(BaseImagePolicy):
     @torch.no_grad()
     def predict_action(self, obs_dict: dict[str, torch.Tensor], *, visual_features=None,
                        prediction_mode: str = "full_then_truncate",
-                       requested_steps: int | None = None):
+                       requested_steps: int | None = None, sample: bool = False):
         """Generate all plans, then full actions or the complete groups needed.
 
         ``action_pred`` contains every generated action, while ``action`` is the
@@ -276,7 +276,7 @@ class ThreadingMVTARPPolicy(BaseImagePolicy):
                 feature_context[str(chunk)] = self._spatial_features(encoded, step)
                 predict_context[str(chunk)] = self._spatial_features(
                     encoded, min(self.action_chunk_size, generated_steps - step))
-        generated = self.policy.generate(prompt, future, sample=False,
+        generated = self.policy.generate(prompt, future, sample=sample,
             contexts={**contexts, "visual-featmap": feature_context,
                       "action-predict-featmap": predict_context})
         plan_end = anchors * views + self.plan_steps * 6

@@ -61,6 +61,15 @@ def test_synchronous_execution_is_default() -> None:
     assert parser.parse_args(["checkpoint", "--episodes", "10"]).episodes == 10
 
 
+def test_aac_deployment_parser_defaults():
+    args = runner.build_parser().parse_args(["checkpoint", "--aac"])
+    assert args.aac
+    assert args.aac_alpha == 3.0
+    assert args.aac_num_samples == 20
+    assert args.aac_execution_candidate_index == 0
+    assert args.prediction_mode == "full_then_truncate"
+
+
 def test_pointcloud_views_follow_checkpoint_metadata() -> None:
     assert runner.pointcloud_views_for_policy(SimpleNamespace(pointcloud_views=("sideview",))) == (
         "sideview",

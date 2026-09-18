@@ -62,6 +62,19 @@ def _small_model(**kwargs):
         vit_depth=1, arp_depth=1, dropout=0, **kwargs)
 
 
+def test_aac_stochastic_full_plan_with_real_threading_decoder():
+    from AAC import AACConfig, AACInference
+    from AAC.arp import predict_arp_aac
+
+    torch.manual_seed(24)
+    model = _small_model(plan_steps=3)
+    obs = {key: value[:1] for key, value in _plan_batch()["obs"].items()}
+    prediction, result = predict_arp_aac(model, obs, AACInference(AACConfig(num_samples=4)))
+    assert prediction["action_pred"].shape == (1, 3, 7)
+    assert prediction["action"].shape == (1, result.decision.h_star, 7)
+    assert result.candidate_max_variance > 0
+
+
 def test_pointcloud_views_are_checkpoint_metadata():
     model = _small_model(pointcloud_views=("sideview",))
     assert model.pointcloud_views == ("sideview",)

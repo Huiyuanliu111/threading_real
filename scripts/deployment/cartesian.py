@@ -300,12 +300,12 @@ class PI05DeploymentPolicy:
         self.horizon = int(self.model.config.chunk_size)
         self.n_action_steps = int(self.model.config.n_action_steps)
         action_feature = self.model.config.output_features["action"]
-        if self.horizon != 10 or int(action_feature.shape[0]) != 7:
-            raise ValueError("pi0.5 checkpoint must emit a 10x7 action chunk")
+        if self.horizon < 1 or int(action_feature.shape[0]) != 7:
+            raise ValueError("pi0.5 checkpoint must emit a nonempty Hx7 action chunk")
 
     @property
     def adaptive(self) -> bool:
-        return self.engine is not None
+        return self.engine is not None or getattr(self, "aac", None) is not None
 
     def set_prediction_mode(self, mode: str) -> None:
         if mode not in {"required_only", "full_then_truncate"}:
@@ -323,6 +323,12 @@ class PI05DeploymentPolicy:
             "observation.state": observations["agent_pos"][0, -1],
             "task": self.task,
         }
+        if getattr(self, "aac", None) is not None:
+            from AAC.pi05 import predict_pi05_aac
+
+            return predict_pi05_aac(
+                self, frame, closed_width_threshold=self.aac_closed_width_threshold
+            )
         if self.engine is not None:
             prediction = self.engine.predict(
                 self.engine.prepare(frame), mode=self.prediction_mode
@@ -485,6 +491,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--results-csv", type=Path, help="CSV filename for timed evaluation; resume numbering when the file exists")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--policy-kind", choices=("auto", "pushbox", "smolvla", "pi05"), default="auto")
+    parser.add_argument("--aac", action="store_true", help="pi0.5 or MVT ARP training-free AAC execution")
+    parser.add_argument("--aac-alpha", type=float, default=3.0, help="AAC minimum movement magnitude")
+    parser.add_argument("--aac-num-samples", type=int, default=20)
+    parser.add_argument("--aac-sample-batch-size", type=int, default=1,
+                        help="ARP AAC candidates per forward pass; total remains --aac-num-samples")
+    parser.add_argument("--aac-execution-candidate-index", type=int, default=0)
     parser.add_argument(
         "--chunk-selector",
         type=Path,
@@ -622,7 +634,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run(args: argparse.Namespace) -> int:
     results = (EpisodeResults(args.results_csv, task="threading",
-                              condition="selector" if args.chunk_selector else "no_selector",
+                              condition="aac" if args.aac else ("selector" if args.chunk_selector else "no_selector"),
                               executed=args.execute) if args.results_csv else None)
     from remote_controller.RemoteControllerClient import RemoteControllerClient
     try:
@@ -646,6 +658,20 @@ def run(args: argparse.Namespace) -> int:
     ):
         raise ValueError("synchronous wait settings must be positive")
     workspace_min = workspace_max = None
+    aac = None
+    if args.aac:
+        from AAC import AACConfig, AACInference
+
+        if args.aac_sample_batch_size < 1:
+            raise ValueError("--aac-sample-batch-size must be positive")
+        if args.chunk_selector is not None or args.execution_schedule is not None:
+            raise ValueError("--aac cannot be combined with a selector or execution schedule")
+        if args.prediction_mode != "full_then_truncate":
+            raise ValueError("--aac requires --prediction-mode full_then_truncate")
+        aac = AACInference(AACConfig(
+            alpha=args.aac_alpha, num_samples=args.aac_num_samples,
+            execution_candidate_index=args.aac_execution_candidate_index,
+        ))
     policy = load_deployment_policy(
         args.checkpoint,
         device=args.device,
@@ -655,6 +681,11 @@ def run(args: argparse.Namespace) -> int:
         selector=args.chunk_selector,
         prediction_mode=args.prediction_mode,
     )
+    if aac is not None:
+        if not isinstance(policy, PI05DeploymentPolicy) and not getattr(policy, "uses_mvt", False):
+            raise ValueError("--aac requires a pi0.5 or MVT ARP checkpoint")
+        policy.aac = aac
+        policy.aac_closed_width_threshold = args.gripper_close_threshold
     if getattr(policy, "action_mode", None) != "cartesian_delta" or int(policy.action_dim) != 7:
         raise ValueError("checkpoint must be a 7D cartesian_delta policy")
     pointcloud_mode = bool(getattr(policy, "uses_pointcloud", False))
@@ -693,7 +724,7 @@ def run(args: argparse.Namespace) -> int:
     max_execution_steps = execution_schedule.coarse_steps if execution_schedule else args.execute_steps
     if mvt_selector is not None:
         max_execution_steps = max(mvt_selector.candidate_chunks)
-    max_period = (policy.horizon if adaptive_pi05 else max_execution_steps) / args.policy_hz
+    max_period = (policy.horizon if adaptive_pi05 or args.aac else max_execution_steps) / args.policy_hz
     if args.synchronous and args.sync_timeout <= max_period:
         raise ValueError("--sync-timeout must exceed the maximum executed chunk / policy_hz")
     if not adaptive_pi05:
@@ -764,6 +795,8 @@ def run(args: argparse.Namespace) -> int:
         if args.execute:
             streamer = client.create_trackc_streamer(command_ip=args.server_ip, command_port=args.command_port, stream_hz=args.stream_hz, samples_per_segment=samples)
         execution_text = "selector[4,10]" if adaptive_pi05 else str(args.execute_steps)
+        if args.aac:
+            execution_text = f"AAC[alpha={args.aac_alpha},N={args.aac_num_samples}]"
         if execution_schedule:
             execution_text = f"endpoint[{execution_schedule.coarse_steps}->{execution_schedule.fine_steps}]"
             print(f"[runner] endpoint_xyz_m={execution_schedule.endpoint_xyz_m.tolist()} "
@@ -874,9 +907,23 @@ def run(args: argparse.Namespace) -> int:
                     history.append(make_observation(side, wrist, front, state["q"], width, args.image_size, args.pre_resize_image_size, tcp_position=T_observation[:3, 3]))
                     policy_obs = stack_observations(history, args.device, rgb_keys=rgb_keys)
                 mvt_selection = None
+                aac_selection = None
                 mode_diagnostics = {}
                 with torch.inference_mode():
-                    if mvt_mode:
+                    if mvt_mode and args.aac:
+                        from AAC.arp import predict_arp_aac
+
+                        prediction, aac_selection = predict_arp_aac(
+                            policy, policy_obs, aac, current_width=width,
+                            closed_width_threshold=args.gripper_close_threshold,
+                            sample_batch_size=args.aac_sample_batch_size,
+                        )
+                        raw = prediction["action_pred"][0].detach().cpu().numpy()
+                        mode_diagnostics = dict(prediction["prediction_diagnostics"])
+                        mode_diagnostics.update(guard_scope="designated_candidate_full_horizon",
+                                                checked_steps=len(raw))
+                        policy.last_prediction_diagnostics = mode_diagnostics
+                    elif mvt_mode:
                         from chunk_selector.mvt_features import predict_for_execution
                         start = time.monotonic()
                         prediction, mvt_selection = predict_for_execution(
@@ -941,7 +988,10 @@ def run(args: argparse.Namespace) -> int:
                     steps, execution_diagnostics = execution_schedule.select(T_now[:3, 3], poses)
                     execution_diagnostics["predicted_action_count"] = len(raw)
                     raw, poses, widths = raw[:steps], poses[:steps], widths[:steps]
-                if mvt_selection is not None:
+                if aac_selection is not None:
+                    steps = aac_selection.decision.h_star
+                    raw, poses, widths = raw[:steps], poses[:steps], widths[:steps]
+                elif mvt_selection is not None:
                     steps = int(mvt_selection.chunk_sizes[0])
                     raw, poses, widths = raw[:steps], poses[:steps], widths[:steps]
                 elif mvt_mode and execution_schedule is None:
