@@ -1,18 +1,20 @@
 # OpenPI π0.5 Threading：6 维动作，无夹爪
 
-本机实机部署见 [部署命令](../../doc/deploy_pi05_openpi.md)：2000 步权重已复制到本机，4060 Ti 直接推理，本机连接相机。使用 `bash threading_real/pi05_openpi/run_deploy.sh`；默认完整预测 H50、固定执行 1 步，需显式添加 `--execute --confirm-real-robot` 才执行模型动作。
+> 2026-09-21：v4 已按用户要求删除，本机和服务器的2000步权重及对应配置已移除。下文引用v4的部署命令和验证结果仅为历史记录，不能直接启动；需先配置新的checkpoint。
 
-当前默认：LoRA、30 Hz、chunk=50、10,000 steps；每 2,000 steps 完整验证，仅保留 val loss 最低的 checkpoint。
+历史本机部署见 [部署命令](../../doc/deploy_pi05_openpi.md)：2000 步权重当时复制到本机，4060 Ti 直接推理，本机连接相机。使用 `bash threading_real/pi05_openpi/run_deploy.sh`；默认完整预测 H50、固定执行 50 步，需显式添加 `--execute --confirm-real-robot` 才执行模型动作。
+
+训练参数默认沿用 v6 配方（不表示该实验仍在运行）：action expert 全量微调（427,932,672 参数），视觉编码器注意力 Q/K/V/out 与 MLP 使用 LoRA（rank=16、alpha=16，8,695,296 参数），动作投影及时间 MLP 全量训练（2,165,792 参数）。总可训练参数 438,793,760；语言模型与视觉非 LoRA 权重冻结。30 Hz、chunk=50、10,000 steps；每 1,000 steps 验证，每 2,000 steps 保存并保留全部定期 checkpoint。
 新启动训练默认启用 W&B **online**（项目 `threading_pi05_openpi`），可显式用 `--no-wandb` 关闭。
 启用时强制 online，不受遗留 WANDB_MODE=offline 影响；服务器已存在登录凭据。
-当前已经运行的 v4 进程是在 W&B 关闭时启动，此默认值修改不会热更新该进程，也不会为切换日志而重启训练。
+v4/v5/v6 均已按用户要求停止。v5 于 2026-09-21 按用户要求停止，最后记录 step=700，未到第一个 checkpoint 保存步。v6 使用独立实验，从 pi05_base 初始化。
 
 基础权重为 `gs://openpi-assets/checkpoints/pi05_base/params`，没有使用 LIBERO 数据或权重。
 OpenPI 源码基于 revision `215abfb217dbac7d5f1273282331b9b1866c0479`。
 
 **当前 6D v4 训练已于 2026-09-20 按用户要求停止，GPU 已释放。** 服务器旧实验 v3 的第 2,000 步 checkpoint 已按用户要求删除；日志和旧配置保留。
 旧实验夹爪归一化尺度过小，首次 val loss=3104.78，不能视为有效收敛。
-新实验名 `threading_lora_tcp6_30hz_h50_best_v4`；不要用旧 checkpoint 的 `--resume` 恢复本实验。
+新实验名 `threading_tcp6_30hz_h50_vision_lora_action_full_v6`，从 pi05_base 初始化；不要使用 v4 checkpoint 的 `--resume`。历史配置缺少冻结开关时仍按旧规则加载，兼容 v4 推理。
 
 ## 数据和物理语义
 
@@ -62,18 +64,18 @@ threading_real/pi05/.venv-deploy/bin/python threading_real/pi05_openpi/verify_ra
 - 归一化使用训练集 1%/99% 分位数，不裁剪异常值；50 步重叠 chunk 包括 episode 尾部重复最后动作的填充，不跨 episode。
 - state 离散化进文本 token，state/action 补零至 32 维；没有额外 state dropout。
 - 官方 flow matching，加高斯噪声，时间参数为 `Beta(1.5,1)*0.999+0.001`；loss 沿用官方补齐维度平均。
-- LoRA 使用 `gemma_2b_lora` 和 `gemma_300m_lora`，关闭 EMA。官方冻结规则仅冻结 llm 内非 LoRA 参数；视觉编码器、动作投影等 llm 外参数仍可训练，不是仅训练 adapter。
+- 默认 `--mode vision_lora_action_full`：语言模型使用冻结的 `gemma_2b`，action expert 使用全量可训练的 `gemma_300m`（含自适应归一化参数）；视觉 LoRA 由本目录 `siglip_lora.py` 和 `vision_lora_config.py` 提供。保留原始视觉参数路径，A 随机初始化、B 零初始化；patch/position embedding、LayerNorm 和视觉输出 head 冻结。`--vision-lora-rank 16`，alpha 等于 rank。关闭 EMA。历史 `--mode lora` 配置仍兼容。
 - AdamW、梯度范数裁剪 1.0、warmup=250、peak LR=2.5e-5、cosine decay；不额外修改学习率分组。
 - seed=42，固定 72 条训练 / 8 条验证，40,722 / 4,693 帧。验证 episode `[0,25,28,33,40,51,60,61]`，不参与归一化统计。
-- 每 2,000 steps 验证全部样本；固定随机噪声/时间种子，尾 batch 填充不计入 loss。LoRA 评估实际保存的当前参数。
-- 只有有限且严格更低的 val loss 才保存，新 checkpoint 成功后删除旧最优；不另存 latest/final。val loss 不是实机成功率。
+- `--eval-interval 1000`：每 1,000 steps 验证全部样本；固定随机噪声/时间种子，尾 batch 填充不计入 loss。LoRA 评估当前参数。
+- `--save-interval 2000`：每 2,000 steps 保存并保留全部 checkpoint，无论 val loss 是否改善。保存周期必须是验证周期的整数倍。验证记录中的 improved 表示评估最优，不保证该步有 checkpoint（如第 1,000 步）；从已保存步中按 val loss 选择部署权重。val loss 不是实机成功率。
 
 ## 准备与训练命令
 
 ```bash
 bash threading_real/pi05_openpi/bootstrap.sh
 OPENPI_PY="$PWD/threading_real/pi05_openpi/vendor/openpi/.venv/bin/python"
-COMMON=(--mode lora --exp-name threading_lora_tcp6_30hz_h50_best_v4 --batch-size 12 --fsdp-devices 2)
+COMMON=(--mode vision_lora_action_full --exp-name threading_tcp6_30hz_h50_vision_lora_action_full_v6 --vision-lora-rank 16 --eval-interval 1000 --save-interval 2000 --wandb --batch-size 12 --fsdp-devices 2)
 JAX_PLATFORMS=cpu "$OPENPI_PY" threading_real/pi05_openpi/run.py check "${COMMON[@]}"
 JAX_PLATFORMS=cpu "$OPENPI_PY" threading_real/pi05_openpi/run.py norm "${COMMON[@]}"
 # 启动新实验：
@@ -81,15 +83,15 @@ CUDA_VISIBLE_DEVICES=0,1,3,4,5,6 "$OPENPI_PY" threading_real/pi05_openpi/run.py 
 ```
 
 原始数据构建使用 LeRobot v3 环境，训练读取器使用固定版本的 LeRobot v2.1 API；数据格式为 v2.1。
-统计使用官方 RunningStats，全部训练起始帧参与。训练循环复用官方 init_train_state/train_step，增加完整验证与 best-only 保存。
+统计使用官方 RunningStats，全部训练起始帧参与。训练循环复用官方 init_train_state/train_step，增加完整验证与定期 checkpoint 保存。
 资产、配置、checkpoint 按实验隔离。训练开始后禁止重算统计或改配置；恢复同一实验使用 `--resume`。
-恢复从最优步继续，未保存的后续更新会丢失；数据加载器会重新初始化，不保证精确复现中断时 batch 顺序。
+恢复从最新已保存步继续，未保存的后续更新会丢失；数据加载器会重新初始化，不保证精确复现中断时 batch 顺序。
 
 ```text
-assets/<exp-name>/pi05_threading_lora/<repo-id>/norm_stats.json
-checkpoints/pi05_threading_lora/<exp-name>.json
-checkpoints/pi05_threading_lora/<exp-name>/<best_step>/{params,train_state,assets,metrics}
-checkpoints/pi05_threading_lora/<exp-name>/validation.jsonl
+assets/<exp-name>/pi05_threading_<mode>/<repo-id>/norm_stats.json
+checkpoints/pi05_threading_<mode>/<exp-name>.json
+checkpoints/pi05_threading_<mode>/<exp-name>/<step>/{params,train_state,assets,metrics}
+checkpoints/pi05_threading_<mode>/<exp-name>/validation.jsonl
 ```
 
 ## 离线推理
@@ -101,9 +103,13 @@ checkpoints/pi05_threading_lora/<exp-name>/validation.jsonl
 
 ## 服务器 10.157.174.249
 
+历史记录：v6 曾于 2026-09-21 启动（原 PID 4144880，现已停止），首步 loss=0.08424887；日志 `logs/train_tcp6_vision_lora_action_full_v6_20260921.log`；[W&B v6](https://wandb.ai/huiyuan_tac/threading_pi05_openpi/runs/jzrhwvvb)。
+
+历史清理记录（早于 v4 删除）：已删除旧 v3 的 `data/threading_full_nosmooth_30hz/data`（7D 动作 Parquet）及来源对应的 Hugging Face 缓存，释放约 6.31 GiB。旧元数据、配置、日志保留；当前 tcp6 数据、v4 部署 checkpoint、基础权重及环境保留。清单见 `outputs/threading_cleanup_20260921.json`。
+
 目录 `/home/huiyuan/threading_real/pi05_openpi`。旧 v3 已停止，其 checkpoint 2000 已删除。
 6D v4 已停止（原 PID=4109880），最后记录第 8940 步；日志 `logs/train_tcp6_v4_20260919.log`。
-保留最优第 2000 步 checkpoint，val loss=0.02955778；没有另存停止时的非最优权重，不自动重启。
+历史最优第 2000 步 checkpoint 的 val loss=0.02955778，该权重现已删除；没有另存停止时的非最优权重，不自动重启。
 `logs/train_20260919.log` 是旧 v3 日志，不要用于判断新训练进度；旧暂停记录已归档。
 
 现有 `.venv` 只读复用 `/home/huiyuan/pi05/.venv-pi05` 的共享依赖，并在本环境覆盖 datasets=3.6.0、huggingface-hub=0.32.0。
@@ -113,6 +119,28 @@ JAX=0.5.3、Flax=0.10.2、Orbax=0.11.13、Torch=2.7.1、cuDNN=9.5.1.17。共享�
 首次 JAX 编译和初始化需要数分钟。显存预分配比例 0.85；这不是实时张量显存用量。
 
 用户授权的旧 threading 实验清理清单在 `outputs/threading_cleanup_20260919.json`；其他实验、环境和原始数据未删除。
+
+## cam1 原始 640×480 输入（v8）
+
+`run_native640.sh` 默认选择独立 v8 实验 `threading_tcp6_cam1_native640_vision_lora_action_full_v8`，通过 `--camera-views cam1` 只使用 cam1；保留 v6 的 action expert 全量 + vision LoRA 训练范围，总可训练参数仍为 438,793,760。
+图像来自原始 640×480 视频帧，数据集保存未缩放 RGB；输入模型前左右各补 2、上下各补 5 像素黑边，得到 644×490。没有裁剪、缩放或图像增强。
+视觉位置编码保留预训练 16×16 参数，运行时双三次插值到 35×46；cam1 为唯一视觉输入，共 1,610 tokens，保留 `left_wrist_0_rgb` 槽位名；cam3 和空白槽位不进入视觉编码器或语言模型。
+高分辨率数据在 `data/threading_tcp6_native640_30hz`；数值标签和对齐不变。预览：`outputs/input_native640_examples/`。
+输入尺寸和相机选择由 run-config 的 `image_profile`、`camera_views` 和服务端 metadata 决定；单路部署仅采集/发送 cam1，旧 checkpoint 缺省仍走 224×224。不要把 224 数据放大冒充原图。
+
+```bash
+# 先完成数据重建；原始视频在本机 /home/huiyuan/threading_new。
+OPENPI_PY=<OpenPI环境的python>
+"$OPENPI_PY" threading_real/pi05_openpi/build_native_dataset.py
+JAX_PLATFORMS=cpu OPENPI_PY="$OPENPI_PY" bash threading_real/pi05_openpi/run_native640.sh check
+JAX_PLATFORMS=cpu OPENPI_PY="$OPENPI_PY" bash threading_real/pi05_openpi/run_native640.sh norm
+```
+
+已通过服务器单卡完整基础模型推理测试，输出 50×6 有限值，见 `outputs/native640_setup/model_smoke.json`。训练使用 batch=6/FSDP=2，启动结果见 `outputs/cam1_native640_setup/launch.json`（生成后）。旧权重不代表已经学会高分辨率单相机输入。
+
+服务器启动脚本为 `start_native640_remote.sh`，先计算训练集归一化，再启动训练；日志为 `logs/train_tcp6_cam1_native640_v8_20260921.log`。由于持久磁盘空间有限，服务器数据副本位于 `/dev/shm/huiyuan_pi05_v8/data/threading_tcp6_native640_30hz`，HF datasets 缓存也放在同一内存文件系统；checkpoint、归一化统计和日志仍保存到项目的持久磁盘。服务器重启后须从本机重新同步数据，再使用相同配置恢复训练；本机完整数据不受影响。该脚本用于首次启动，不用于已有 checkpoint 的恢复。
+
+单路模型通过 loss/sample 形状、冻结参数量和输入像素测试，完整 GPU 推理输出 50×6；固定噪声时新增/替换 cam3 输出完全不变。见 `outputs/cam1_native640_setup/model_smoke.json`。原双路数据可复用，仅训练输入选择 cam1，不删除原始 cam3 数据。缺少 `camera_views` 的历史配置仍使用双路。
 
 ## 第 2000 步模型的视觉敏感度诊断
 
@@ -136,3 +164,5 @@ CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_MEM_FRACTION=0.75 \
   --run-config checkpoints/pi05_threading_lora/threading_lora_tcp6_30hz_h50_best_v4.json \
   --output outputs/visual_sensitivity_2000_tcp6_repeat
 ```
+
+远程推理可使用独立入口 `run_deploy_remote.sh`，相机与follower控制仍在本机，见 [服务器推理部署](../../doc/deploy_pi05_openpi_remote.md)。

@@ -6,3 +6,6 @@ checkpoints/
 outputs/
 .cache/
 __pycache__/
+
+# Generated, machine-local deployment settings
+/deployment_config.json
