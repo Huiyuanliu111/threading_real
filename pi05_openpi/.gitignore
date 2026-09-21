@@ -1,0 +1,8 @@
+.venv/
+vendor/
+data/
+assets/
+checkpoints/
+outputs/
+.cache/
+__pycache__/
