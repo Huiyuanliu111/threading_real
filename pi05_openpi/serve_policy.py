@@ -11,6 +11,6 @@ def main():
  from openpi.policies.policy_config import create_trained_policy
  from openpi.serving.websocket_policy_server import WebsocketPolicyServer
  policy=create_trained_policy(config,a.checkpoint,sample_kwargs={'num_steps':10})
- metadata=dict(kind='threading_openpi_tcp6',horizon=50,state_dim=9,action_dim=6,fps=30,checkpoint=str(a.checkpoint.resolve()),task='insert the grasped block through the needle')
+ metadata=dict(kind='threading_openpi_tcp6',horizon=50,state_dim=9,action_dim=6,fps=30,checkpoint=str(a.checkpoint.resolve()),task='insert the grasped block through the needle',image_profile=settings.get('image_profile','224'),camera_views=settings.get('camera_views','both'))
  WebsocketPolicyServer(policy,host=a.host,port=a.port,metadata=metadata).serve_forever()
 if __name__=='__main__':main()

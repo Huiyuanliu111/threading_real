@@ -406,6 +406,7 @@ def wait_for_trackc_segment(
     settle_samples: int,
     poll_hz: float,
     stop_requested: Any,
+    require_target: bool = False,
 ) -> dict[str, float | bool]:
     """Wait until TrackC has sent the segment, then sample its actual tracking error."""
     started = time.monotonic()
@@ -424,7 +425,8 @@ def wait_for_trackc_segment(
                 robot_model, state["q"], frame_name="panda_hand_tcp"
             )
             last_translation, last_rotation = cartesian_pose_error(current_T, target_T)
-            completed_samples = completed_samples + 1 if segment_completed else 0
+            reached = last_translation <= position_tolerance and last_rotation <= rotation_tolerance
+            completed_samples = completed_samples + 1 if segment_completed and (reached or not require_target) else 0
             if completed_samples >= settle_samples:
                 return {
                     "stopped": False,
@@ -439,7 +441,9 @@ def wait_for_trackc_segment(
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 "synchronous TrackC segment wait timed out: "
-                f"segment_completed={segment_completed}, robot_state={info}"
+                f"segment_completed={segment_completed}, require_target={require_target}, "
+                f"translation_error={last_translation * 1000:.3f} mm, rotation_error={np.degrees(last_rotation):.3f} deg, "
+                f"robot_state={info}"
             )
         time.sleep(1.0 / poll_hz)
     return {
@@ -562,6 +566,8 @@ def build_parser() -> argparse.ArgumentParser:
             "observation/inference (default: enabled)"
         ),
     )
+    parser.add_argument("--sync-require-target", action=argparse.BooleanOptionalAction, default=False,
+                        help="require measured endpoint convergence, not only completed UDP sending")
     parser.add_argument("--sync-position-tolerance", type=float, default=0.001)
     parser.add_argument("--sync-rotation-tolerance", type=float, default=0.02)
     parser.add_argument("--sync-timeout", type=float, default=2.0)
@@ -627,9 +633,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.02,
         help="target object width for the initial Franka grasp (must be > 0; default: 0.02 m)",
     )
+    parser.add_argument("--prepare-initial-grasp", action=argparse.BooleanOptionalAction, default=False,
+                        help="open gripper and wait for object placement before initial grasp")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm-real-robot", action="store_true")
     return parser
+
+
+def prepare_initial_grasp(client, args, stop_requested):
+    """Open first, then let the operator place the object before closing."""
+    result = client.gripper_release(args.gripper_speed, queue=False)
+    if result != 0:
+        raise RuntimeError(f"initial gripper opening failed: {result} ({client.decode_rpc_result(result)})")
+    state = client.wait_until_gripper_moving_finished(timeout=15.0)
+    if state != "IDLE":
+        raise RuntimeError(f"initial gripper opening did not finish IDLE: {state}")
+    width = client.get_gripper_width()
+    print(f"[gripper] Opened to {width * 1000:.2f} mm. Arm has not started model execution.", flush=True)
+    return wait_for_episode_enter(
+        f"Place the object between the open fingers (target width {args.initial_grasp_width * 1000:.1f} mm). "
+        "Clear your hands, then press Enter to GRASP. Ctrl+C cancels.", stop_requested,
+    )
 
 
 def run(args: argparse.Namespace) -> int:
@@ -691,6 +715,7 @@ def run(args: argparse.Namespace) -> int:
     pointcloud_mode = bool(getattr(policy, "uses_pointcloud", False))
     rgb_keys = tuple(getattr(policy, "rgb_keys", ()))
     supported_rgb_keys = {
+        ("sideview",),
         ("sideview", "frontview"),
         ("sideview", "wrist", "frontview"),
     }
@@ -734,7 +759,7 @@ def run(args: argparse.Namespace) -> int:
     if args.trace_output is not None:
         args.trace_output = args.trace_output.expanduser().resolve()
         args.trace_output.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(policy, (SmolVLADeploymentPolicy, PI05DeploymentPolicy)):
+    if isinstance(policy, (SmolVLADeploymentPolicy, PI05DeploymentPolicy)) or getattr(policy, "uses_openpi", False):
         if args.gmm_eval_mode != "map":
             raise ValueError("--gmm-eval-mode only applies to PushBox policies")
     elif args.gmm_eval_mode == "map":
@@ -825,6 +850,15 @@ def run(args: argparse.Namespace) -> int:
             if hasattr(reset_target, "reset"):
                 reset_target.reset()
             if args.execute and args.grasp_before_inference:
+                if args.prepare_initial_grasp and not prepare_initial_grasp(client, args, lambda: stop):
+                    break
+                print(
+                    f"[gripper] initial grasp request: width={args.initial_grasp_width:.4f} m, "
+                    f"speed={args.gripper_speed:.4f} m/s, force={args.gripper_force:.1f} N, "
+                    f"epsilon_inner/outer={args.gripper_epsilon:.4f} m; "
+                    f"reported current width={client.get_gripper_width():.4f} m. "
+                    "Controller opens fully before grasping.", flush=True,
+                )
                 result = client.grasp(
                     args.initial_grasp_width,
                     args.gripper_speed,
@@ -835,11 +869,18 @@ def run(args: argparse.Namespace) -> int:
                 )
                 if result != 0:
                     raise RuntimeError(
-                        f"initial grasp failed: {result} ({client.decode_rpc_result(result)})"
+                        f"initial grasp failed: {result} ({client.decode_rpc_result(result)}); "
+                        f"requested width={args.initial_grasp_width:.4f} m, "
+                        f"force={args.gripper_force:.1f} N, speed={args.gripper_speed:.4f} m/s, "
+                        f"epsilon={args.gripper_epsilon:.4f} m; "
+                        f"reported state={client.get_gripper_state()}, "
+                        f"reported width={client.get_gripper_width():.4f} m. "
+                        "Check controller [graspO] logs for open/grasp/is_grasped results. "
+                        "Model execution stopped; reposition the object before retrying. A nearly zero final width can indicate no object between the fingers."
                     )
                 gripper_state = client.wait_until_gripper_moving_finished(timeout=15.0)
-                if gripper_state == "ERROR":
-                    raise RuntimeError("gripper entered ERROR during initial grasp")
+                if gripper_state != "HOLDING":
+                    raise RuntimeError(f"initial grasp not confirmed HOLDING: {gripper_state}; model execution stopped")
                 print(
                     f"[gripper] episode={episode} initial grasp complete: "
                     f"state={gripper_state}, width={client.get_gripper_width():.4f} m"
@@ -981,6 +1022,9 @@ def run(args: argparse.Namespace) -> int:
                         f"limits={args.abort_translation:.4f} m/{args.abort_rotation:.4f} rad; "
                         f"mode={args.prediction_mode} checked_steps={len(raw)}"
                     )
+                state, info = client.get_latest_state(allow_stale=False)
+                if state is None or state["arm_state"] == "ERROR":
+                    raise RuntimeError(f"fresh robot state unavailable before execution: {info}")
                 T_now = client.get_tcp_pose_from_q(robot_model, state["q"], frame_name="panda_hand_tcp")
                 poses, widths, stats = integrate_cartesian_delta_chunk(raw, T_now, width, max_first_translation=args.max_first_translation, max_step_translation=args.max_step_translation, max_first_rotation=args.max_first_rotation, max_step_rotation=args.max_step_rotation, workspace_min=workspace_min, workspace_max=workspace_max)
                 execution_diagnostics = {}
@@ -1010,15 +1054,25 @@ def run(args: argparse.Namespace) -> int:
                             client,
                             robot_model,
                             poses[-1],
-                            position_tolerance=args.sync_position_tolerance,
+                            position_tolerance=(min(args.sync_position_tolerance, max(1e-5, 0.2 * np.linalg.norm(poses[-1][:3, 3] - T_now[:3, 3])))
+                                                if args.sync_require_target else args.sync_position_tolerance),
                             rotation_tolerance=args.sync_rotation_tolerance,
                             timeout=args.sync_timeout,
                             settle_samples=args.sync_settle_samples,
                             poll_hz=args.sync_poll_hz,
                             stop_requested=episode_stop_requested,
+                            require_target=args.sync_require_target,
                         )
                         if sync_result["stopped"]:
                             break
+                        measured_state, _ = client.get_latest_state(allow_stale=False)
+                        if measured_state is not None:
+                            measured_T = client.get_tcp_pose_from_q(robot_model, measured_state["q"], frame_name="panda_hand_tcp")
+                            sync_result["actual_translation_mm"] = float(np.linalg.norm(measured_T[:3, 3] - T_now[:3, 3]) * 1000)
+                            sync_result["command_translation_mm"] = float(np.linalg.norm(poses[-1][:3, 3] - T_now[:3, 3]) * 1000)
+                            if args.sync_require_target or getattr(policy, "uses_openpi", False):
+                                print(f"[tracking] steps={len(raw)} target_delta={sync_result['command_translation_mm']:.3f}mm "
+                                      f"actual_delta={sync_result['actual_translation_mm']:.3f}mm", flush=True)
                 cycle += 1
                 if args.trace_output is not None:
                     trace_record = {

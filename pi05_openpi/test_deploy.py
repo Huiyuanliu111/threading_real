@@ -33,6 +33,7 @@ def test_runner_preconnection_initialization(monkeypatch):
  from threading_real.scripts.deployment import cartesian
  controller=importlib.import_module('remote_controller.RemoteControllerClient')
  policy=LocalPolicy(Client())
+ policy.rgb_keys=("sideview",)
  monkeypatch.setattr(cartesian,'load_deployment_policy',lambda *a,**kw:policy)
  class ReachedConnectionBoundary(Exception):pass
  def stop_before_connect(*args,**kwargs):raise ReachedConnectionBoundary()
@@ -73,3 +74,66 @@ def test_staged_grasp_open_failure_aborts(monkeypatch):
  monkeypatch.setattr(cartesian,'wait_for_episode_enter',lambda *args:pytest.fail('must not request placement after failed opening'))
  with pytest.raises(RuntimeError,match='opening failed'):
   cartesian.prepare_initial_grasp(Gripper(),SimpleNamespace(gripper_speed=.05),lambda:False)
+
+def test_strict_tracking_does_not_confuse_sent_with_reached():
+ import threading
+ from types import SimpleNamespace
+ import pytest
+ from threading_real.scripts.deployment import cartesian
+ streamer=SimpleNamespace(manager=SimpleNamespace(lock=threading.Lock(),completed=True))
+ class Client:
+  def get_latest_state(self,**kwargs):return {'q':np.zeros(7),'arm_state':'MOVING'},{}
+  def get_tcp_pose_from_q(self,*args,**kwargs):return np.eye(4)
+ target=np.eye(4);target[0,3]=.0005
+ with pytest.raises(RuntimeError,match='translation_error=0.500 mm'):
+  cartesian.wait_for_trackc_segment(streamer,Client(),None,target,position_tolerance=.0001,
+   rotation_tolerance=.02,timeout=.005,settle_samples=1,poll_hz=1000,stop_requested=lambda:False,require_target=True)
+ result=cartesian.wait_for_trackc_segment(streamer,Client(),None,np.eye(4),position_tolerance=.0001,
+   rotation_tolerance=.02,timeout=.1,settle_samples=1,poll_hz=1000,stop_requested=lambda:False,require_target=True)
+ assert result['within_tolerance']
+
+def test_remote_timeout_discards_connection():
+ import pytest
+ import deploy_remote
+ class Socket:
+  closed=False
+  def send(self,data):pass
+  def recv(self,timeout):raise TimeoutError()
+  def close(self):self.closed=True
+ backend=object.__new__(deploy_remote.RemoteBackend)
+ backend.ws=Socket();backend.packer=deploy_remote.msgpack_numpy.Packer()
+ with pytest.raises(RuntimeError,match='no stale prediction accepted'):
+  backend._request({'state':np.zeros(9)},timeout=.1)
+ assert backend.ws.closed
+
+
+def test_native_resolution_metadata_and_payload():
+ class NativeClient:
+  def get_server_metadata(self):
+   return {**Client().get_server_metadata(), 'image_profile':'native640'}
+  def infer(self,obs):
+   assert obs['front'].shape==(490,644,3)
+   assert obs['side'].shape==(490,644,3)
+   assert obs['front'][5,2,0]==7
+   assert obs['side'][5,2,0]==3
+   return {'actions':np.zeros((50,6),np.float32)}
+ p=LocalPolicy(NativeClient())
+ assert p.image_shape==(3,490,644)
+ obs={'agent_pos':torch.zeros(1,1,9),
+      'frontview':torch.full((1,1,3,490,644),7,dtype=torch.uint8),
+      'sideview':torch.full((1,1,3,490,644),3,dtype=torch.uint8)}
+ assert p.predict_action(obs)['action'].shape==(1,50,7)
+
+
+def test_cam1_only_deployment_does_not_read_or_send_front():
+ class Cam1Client:
+  def get_server_metadata(self):
+   return {**Client().get_server_metadata(),'image_profile':'native640','camera_views':'cam1'}
+  def infer(self,obs):
+   assert set(obs)=={'side','state','prompt'}
+   assert obs['side'].shape==(490,644,3)
+   return {'actions':np.zeros((50,6),np.float32)}
+ p=LocalPolicy(Cam1Client())
+ assert p.rgb_keys==('sideview',)
+ obs={'agent_pos':torch.zeros(1,1,9),'sideview':torch.zeros(1,1,3,490,644,dtype=torch.uint8)}
+ assert p.predict_action(obs)['action'].shape==(1,50,7)
