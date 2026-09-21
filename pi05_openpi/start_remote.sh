@@ -31,4 +31,4 @@ for row in rows.splitlines():
 print(f'Preflight: {free:.1f} GiB free; GPUs {sorted(selected)} idle', flush=True)
 PY
 printf '%s\n' "$$" > logs/train.pid
-exec .venv/bin/python -u run.py train --mode lora --batch-size 12 --fsdp-devices 2 "$@"
+exec .venv/bin/python -u run.py train --batch-size 12 --fsdp-devices 2 "$@"

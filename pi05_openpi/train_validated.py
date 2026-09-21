@@ -1,4 +1,4 @@
-"""Official OpenPI train_step plus episode validation and best-only checkpoints."""
+"""Official OpenPI train_step with independent validation and periodic checkpoints."""
 import functools
 import json
 import logging
@@ -15,24 +15,40 @@ from openpi.training import checkpoints, data_loader, sharding
 from validation import (MetricsSaver, eval_loss, evaluate, finite_loader, is_improvement, raw_subset)
 
 
-def main(config, settings):
-    upstream.init_logging()
-    if jax.process_count() != 1:
-        raise ValueError('This entry point supports single-process, multi-GPU training')
-    directory = config.checkpoint_dir
-    if directory.exists() and not config.resume:
-        raise FileExistsError(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    manager = ocp.CheckpointManager(directory, item_handlers={
+def create_checkpoint_manager(directory):
+    return ocp.CheckpointManager(directory, item_handlers={
         'assets': checkpoints.CallbackHandler(),
         'train_state': ocp.PyTreeCheckpointHandler(),
         'params': ocp.PyTreeCheckpointHandler(),
     }, options=ocp.CheckpointManagerOptions(
-        max_to_keep=1, keep_period=None, best_fn=lambda metrics: metrics['val_loss'],
-        best_mode='min', create=False, async_options=ocp.AsyncOptions(timeout_secs=7200)))
+        max_to_keep=None, keep_period=None,
+        best_fn=lambda metrics: metrics['val_loss'] if metrics['val_loss'] is not None else math.inf,
+        best_mode='min',
+        create=False, async_options=ocp.AsyncOptions(timeout_secs=7200)))
+
+
+def main(config, settings):
+    upstream.init_logging()
+    if jax.process_count() != 1:
+        raise ValueError('This entry point supports single-process, multi-GPU training')
+    eval_interval = settings.get('eval_interval', config.save_interval)
+    if eval_interval < 1 or config.save_interval % eval_interval:
+        raise ValueError('save_interval must be a multiple of the positive eval_interval')
+    directory = config.checkpoint_dir
+    if directory.exists() and not config.resume:
+        raise FileExistsError(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    manager = create_checkpoint_manager(directory)
     try:
         resuming = config.resume and manager.latest_step() is not None
-        best = float(manager.metrics(manager.latest_step())['val_loss']) if resuming else math.inf
+        best = math.inf
+        if resuming:
+            history = directory / 'validation.jsonl'
+            if history.exists():
+                for line in history.read_text().splitlines():
+                    row = json.loads(line)
+                    if row['step'] <= manager.latest_step() and row['val_loss'] is not None:
+                        best = min(best, row['val_loss'])
         if config.wandb_enabled:
             os.environ["WANDB_MODE"] = "online"
         upstream.init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
@@ -65,7 +81,7 @@ def main(config, settings):
                 metrics = {k: float(v) for k, v in jax.device_get(info).items()}
                 logging.info('Step %d: %s', step, metrics)
                 wandb.log(metrics, step=step)
-            if step % config.save_interval:
+            if step % eval_interval:
                 continue
             loss = evaluate(state, validation, val_fn, config.seed + 1, config.batch_size, data_sharding, mesh)
             improved = is_improvement(loss, best)
@@ -74,11 +90,12 @@ def main(config, settings):
             logging.info('Validation: %s', record)
             wandb.log({'val_loss': loss}, step=step)
             if improved:
-                checkpoints.save_state(MetricsSaver(manager, loss), state, training, step)
-                manager.wait_until_finished()
                 best = loss
             with (directory / 'validation.jsonl').open('a') as stream:
                 stream.write(json.dumps(record, allow_nan=False) + '\n')
+            if step % config.save_interval == 0:
+                checkpoints.save_state(MetricsSaver(manager, record['val_loss']), state, training, step)
+                manager.wait_until_finished()
         manager.wait_until_finished()
     finally:
         manager.close()

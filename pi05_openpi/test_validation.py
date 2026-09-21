@@ -37,6 +37,12 @@ class ValidationTests(unittest.TestCase):
         from run import parser
         args = parser().parse_args(['train'])
         self.assertEqual((args.horizon, args.steps, args.save_interval), (50, 10000, 2000))
+        self.assertEqual(args.eval_interval, 1000)
+        self.assertTrue(args.wandb)
+        self.assertTrue(args.freeze_vision)
+        self.assertTrue(args.freeze_language)
+        self.assertEqual(args.mode, 'vision_lora_action_full')
+        self.assertEqual(args.vision_lora_rank, 16)
         self.assertEqual(args.val_fraction, .1)
 
 

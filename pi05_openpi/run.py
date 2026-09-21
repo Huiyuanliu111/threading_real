@@ -19,8 +19,15 @@ def parser():
     p.add_argument("--openpi-root", type=Path, default=Path(os.environ.get("OPENPI_ROOT", HERE / "vendor/openpi")))
     p.add_argument("--dataset-root", type=Path, default=HERE / "data/threading_tcp6_nosmooth_30hz")
     p.add_argument("--repo-id", default="threading_real/threading_tcp6_nosmooth_30hz")
-    p.add_argument("--exp-name", default="threading_lora_tcp6_30hz_h50_best_v4")
-    p.add_argument("--mode", choices=["full", "lora"], default="lora")
+    p.add_argument("--exp-name", default="threading_tcp6_30hz_h50_vision_lora_action_full_v6")
+    p.add_argument("--mode", choices=["full", "lora", "vision_lora_action_full"], default="vision_lora_action_full")
+    p.add_argument("--vision-lora-rank", type=int, default=16)
+    p.add_argument("--image-profile", choices=["224", "native640"], default="224",
+                   help="native640 preserves 640x480 pixels and only pads to 644x490")
+    p.add_argument("--camera-views", choices=["both", "cam1"], default="both")
+    p.add_argument("--freeze-vision", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--freeze-language", action=argparse.BooleanOptionalAction, default=True,
+                   help="Freeze language backbone including its LoRA; focus updates on action expert")
     p.add_argument("--base-checkpoint", default="gs://openpi-assets/checkpoints/pi05_base")
     p.add_argument("--horizon", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=12, help="Global batch across all visible GPUs")
@@ -30,6 +37,7 @@ def parser():
     p.add_argument("--learning-rate", type=float, default=2.5e-5)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--save-interval", type=int, default=2000)
+    p.add_argument("--eval-interval", type=int, default=1000)
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--assets-dir", type=Path, default=HERE / "assets")
@@ -59,6 +67,10 @@ def bind_dataset(settings):
     source = Path(settings["dataset_root"])
     info = json.loads((source / "meta/info.json").read_text())
     validate_info(info)
+    if settings.get("image_profile", "224") == "native640":
+        from transforms import FRONT, SIDE
+        if any(info['features'][key]['shape'] != [480, 640, 3] for key in (FRONT, SIDE)):
+            raise ValueError("native640 requires the rebuilt original-resolution dataset, not 224 images")
     if info["codebase_version"] != "v2.1":
         raise ValueError("Export v3 data with export_dataset.py before using the pinned OpenPI reader")
     from lerobot.common.constants import HF_LEROBOT_HOME
@@ -82,7 +94,7 @@ def main():
             raise ValueError(f"Invalid {key}")
     if "/" in settings["exp_name"]:
         raise ValueError("exp-name must be one directory name")
-    for key in ("horizon", "batch_size", "fsdp_devices", "steps", "save_interval"):
+    for key in ("horizon", "batch_size", "fsdp_devices", "steps", "save_interval", "eval_interval", "vision_lora_rank"):
         if settings[key] < 1:
             raise ValueError(f"{key} must be positive")
     if not 0 <= settings["warmup_steps"] < settings["steps"]:
@@ -93,6 +105,8 @@ def main():
         raise ValueError("val-fraction must lie between 0 and 1")
     if settings["steps"] % settings["save_interval"]:
         raise ValueError("steps must be divisible by save-interval")
+    if settings["save_interval"] % settings["eval_interval"]:
+        raise ValueError("save-interval must be divisible by eval-interval so checkpoints have validation metrics")
     # Stats are isolated by experiment so another dataset/run cannot overwrite them.
     settings["assets_dir"] = str(Path(settings["assets_dir"]) / settings["exp_name"])
     settings["fps"] = 30
@@ -100,6 +114,8 @@ def main():
     settings["physical_action_dim"] = 6
     settings["physical_state_dim"] = 9
     settings["training_image_augmentation"] = "OpenPI default: front 95% random crop and +/-5deg rotation; both cameras color jitter (brightness=.3, contrast=.4, saturation=.5)"
+    if settings["image_profile"] == "native640":
+        settings["training_image_augmentation"] = "None: original 640x480 pixels; pad L/R=2, T/B=5 to 644x490; no resize/crop"
     print(json.dumps(settings, indent=2), flush=True)
     if args.print_config:
         return

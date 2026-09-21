@@ -73,6 +73,8 @@ def verify(root):
                             expected = np.zeros((224,224,3), np.uint8)
                             expected[(224-nh)//2:(224-nh)//2+nh, (224-nw)//2:(224-nw)//2+nw] = cv2.resize(
                                 rgb, (nw,nh), interpolation=cv2.INTER_AREA)
+                            if info['features'][key]['shape'] == [480, 640, 3]:
+                                expected = rgb
                             saved = np.asarray(Image.open(io.BytesIO(images[key][frame].as_py()["bytes"])))
                             np.testing.assert_array_equal(saved, expected)
                             image_checks += 1

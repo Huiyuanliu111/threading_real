@@ -33,19 +33,30 @@ def parse_image(value):
 
 @dataclasses.dataclass(frozen=True)
 class ThreadingInputs:
+    camera_views: str = "both"
+
     def __call__(self, data):
         state = np.asarray(data["state"], dtype=np.float32)
         if state.shape != (9,) or not np.isfinite(state).all():
             raise ValueError("Expected finite 9D tcp_pose_6d state")
-        front, side = parse_image(data["front"]), parse_image(data["side"])
+        side = parse_image(data["side"])
+        if self.camera_views == "cam1":
+            images = {"left_wrist_0_rgb": side}
+            masks = {"left_wrist_0_rgb": np.True_}
+        elif self.camera_views == "both":
+            front = parse_image(data["front"])
+            images = {"base_0_rgb": front, "left_wrist_0_rgb": side,
+                      "right_wrist_0_rgb": np.zeros_like(front)}
+            masks = {"base_0_rgb": np.True_, "left_wrist_0_rgb": np.True_,
+                     "right_wrist_0_rgb": np.False_}
+        else:
+            raise ValueError(f"Unknown camera_views: {self.camera_views}")
         result = {
             "state": state,
             # The second exterior camera occupies the model's second image slot.
             # This name does not change its physical meaning into a wrist camera.
-            "image": {"base_0_rgb": front, "left_wrist_0_rgb": side,
-                      "right_wrist_0_rgb": np.zeros_like(front)},
-            "image_mask": {"base_0_rgb": np.True_, "left_wrist_0_rgb": np.True_,
-                           "right_wrist_0_rgb": np.False_},
+            "image": images,
+            "image_mask": masks,
         }
         if "actions" in data:
             actions = np.array(data["actions"], dtype=np.float32, copy=True)
