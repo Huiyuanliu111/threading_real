@@ -38,7 +38,11 @@ def parser():
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--save-interval", type=int, default=2000)
     p.add_argument("--eval-interval", type=int, default=1000)
+    p.add_argument("--max-checkpoints", type=int, default=None,
+                   help="Keep the latest N checkpoints; default retains every checkpoint")
     p.add_argument("--val-fraction", type=float, default=0.1)
+    p.add_argument("--overfit-episodes", type=int, default=0,
+                   help="Train and evaluate on the same seeded selection of N whole episodes; 0 uses held-out validation")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--assets-dir", type=Path, default=HERE / "assets")
     p.add_argument("--checkpoint-dir", type=Path, default=HERE / "checkpoints")
@@ -103,6 +107,11 @@ def main():
         raise ValueError("Invalid workers or learning rate")
     if not 0 < settings["val_fraction"] < 1:
         raise ValueError("val-fraction must lie between 0 and 1")
+    if settings["overfit_episodes"] < 0:
+        raise ValueError("overfit-episodes must be >= 0")
+    if settings["max_checkpoints"] is not None and settings["max_checkpoints"] < 1:
+        raise ValueError("max-checkpoints must be positive")
+    settings["evaluation_scope"] = "train_reconstruction" if settings["overfit_episodes"] else "held_out"
     if settings["steps"] % settings["save_interval"]:
         raise ValueError("steps must be divisible by save-interval")
     if settings["save_interval"] % settings["eval_interval"]:
@@ -121,8 +130,8 @@ def main():
         return
     config = setup(settings)
     info = bind_dataset(settings)
-    from validation import episode_split, compute_norm, validate_norm
-    split, _ = episode_split(settings["dataset_root"], settings["val_fraction"], settings["seed"])
+    from validation import split_from_settings, compute_norm, validate_norm
+    split, _ = split_from_settings(settings)
     settings["validation_split"] = split
     print(json.dumps({"validation_split": split}, indent=2), flush=True)
     import openpi.training.config as registry
@@ -150,12 +159,15 @@ def main():
     # validate_norm separately enforces the split and action representation.
     if manifest.exists() and config.checkpoint_dir.exists():
         previous = json.loads(manifest.read_text())
+        previous.setdefault("overfit_episodes", 0)
+        previous.setdefault("max_checkpoints", None)
+        previous.setdefault("evaluation_scope", "held_out")
         if {k: v for k, v in previous.items() if k != "resume"} != {k: v for k, v in settings.items() if k != "resume"}:
             raise ValueError(f"Run settings differ from {manifest}; use a new exp-name")
     if args.command == "norm":
         if config.checkpoint_dir.exists():
             raise FileExistsError("Do not recompute normalization after training starts; use a new exp-name")
-        if info["total_frames"] < config.batch_size:
+        if split["train_frames"] < config.batch_size:
             raise ValueError("Dataset must contain at least one full batch for official norm computation")
         compute_norm(config, settings)
     else:

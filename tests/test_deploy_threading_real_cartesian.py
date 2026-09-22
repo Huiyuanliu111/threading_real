@@ -159,3 +159,17 @@ def test_synchronous_wait_completes_segment_despite_impedance_error() -> None:
     assert result["stopped"] is False
     assert result["within_tolerance"] is False
     assert result["translation_error"] == pytest.approx(0.004)
+
+
+def test_autohorizon_deployment_defaults_and_conflicts():
+    parser = runner.build_parser()
+    args = parser.parse_args(['checkpoint', '--autohorizon'])
+    config = runner.autohorizon_config_from_args(args)
+    assert config.hold_thr == .3 and config.max_entropy_q == .9
+    assert config.run_len == 1 and config.method == 'bidirectional'
+    assert runner.autohorizon_config_from_args(parser.parse_args(['checkpoint'])) is None
+    for flags in (['--aac'], ['--chunk-selector', 'selector'],
+                  ['--execution-schedule', 'schedule.yaml'],
+                  ['--prediction-mode', 'required_only']):
+        with pytest.raises(ValueError, match='--autohorizon'):
+            runner.autohorizon_config_from_args(parser.parse_args(['checkpoint', '--autohorizon', *flags]))

@@ -66,6 +66,40 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(int(restored.step), 10000)
                 np.testing.assert_array_equal(restored.ema_params['w'].value, [2.])
 
+    def test_capped_checkpoint_retention_keeps_latest_not_best(self):
+        import jax.numpy as jnp
+        import optax
+        import flax.nnx as nnx
+        from openpi.training import checkpoints
+        from openpi.training.utils import TrainState
+        from validation import MetricsSaver
+        from train_validated import create_checkpoint_manager
+
+        model = nnx.Dict(w=nnx.Param(jnp.array([1.])))
+        graph, params = nnx.split(model)
+        state = TrainState(step=0, params=params, model_def=graph,
+                           tx=optax.sgd(.1), opt_state=(), ema_decay=None, ema_params=None)
+
+        class Loader:
+            def data_config(self):
+                from types import SimpleNamespace
+                return SimpleNamespace(norm_stats=None, asset_id=None)
+
+        with tempfile.TemporaryDirectory() as path:
+            with create_checkpoint_manager(path, max_to_keep=2) as manager:
+                # The earliest checkpoint is best: score-based retention would keep it.
+                for step, loss in [(500, .1), (1000, .2), (1500, .3)]:
+                    updated = dataclasses.replace(state, step=step)
+                    checkpoints.save_state(MetricsSaver(manager, loss), updated, Loader(), step)
+                    manager.wait_until_finished()
+                self.assertEqual(list(manager.all_steps()), [1000, 1500])
+                self.assertEqual({p.name for p in Path(path).iterdir() if p.name.isdigit()},
+                                 {'1000', '1500'})
+            with create_checkpoint_manager(path, max_to_keep=2) as manager:
+                self.assertEqual(list(manager.all_steps()), [1000, 1500])
+                restored = checkpoints.restore_state(manager, state, Loader())
+                self.assertEqual(int(restored.step), 1500)
+
     def test_eval_ema_no_augmentation_and_full_tail(self):
         import flax.nnx as nnx
         import jax

@@ -407,6 +407,7 @@ def wait_for_trackc_segment(
     poll_hz: float,
     stop_requested: Any,
     require_target: bool = False,
+    diagnostics: Any = None,
 ) -> dict[str, float | bool]:
     """Wait until TrackC has sent the segment, then sample its actual tracking error."""
     started = time.monotonic()
@@ -425,6 +426,10 @@ def wait_for_trackc_segment(
                 robot_model, state["q"], frame_name="panda_hand_tcp"
             )
             last_translation, last_rotation = cartesian_pose_error(current_T, target_T)
+            if diagnostics is not None:
+                diagnostics.wait_sample(state=state, info=info, T=current_T, streamer=streamer,
+                                        target_T=target_T, segment_completed=segment_completed,
+                                        translation_error_m=last_translation, rotation_error_rad=last_rotation)
             reached = last_translation <= position_tolerance and last_rotation <= rotation_tolerance
             completed_samples = completed_samples + 1 if segment_completed and (reached or not require_target) else 0
             if completed_samples >= settle_samples:
@@ -439,6 +444,11 @@ def wait_for_trackc_segment(
                     ),
                 }
         if time.monotonic() >= deadline:
+            if diagnostics is not None:
+                diagnostics.emit('wait_timeout', state=state, info=info, streamer=streamer,
+                                 target_T=target_T, segment_completed=segment_completed,
+                                 translation_error_m=last_translation, rotation_error_rad=last_rotation,
+                                 position_tolerance_m=position_tolerance, rotation_tolerance_rad=rotation_tolerance)
             raise RuntimeError(
                 "synchronous TrackC segment wait timed out: "
                 f"segment_completed={segment_completed}, require_target={require_target}, "
@@ -497,6 +507,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-kind", choices=("auto", "pushbox", "smolvla", "pi05"), default="auto")
     parser.add_argument("--aac", action="store_true", help="pi0.5 or MVT ARP training-free AAC execution")
     parser.add_argument("--aac-alpha", type=float, default=3.0, help="AAC minimum movement magnitude")
+    parser.add_argument("--autohorizon", action="store_true",
+                        help="select execution length from MVT/PlanARP action attention")
+    parser.add_argument("--autohorizon-hold-thr", type=float, default=0.3)
+    parser.add_argument("--autohorizon-entropy-q", type=float, default=0.9)
+    parser.add_argument("--autohorizon-run-len", type=int, default=1)
+    parser.add_argument("--autohorizon-method", choices=("bidirectional", "forward"),
+                        default="bidirectional")
     parser.add_argument("--aac-num-samples", type=int, default=20)
     parser.add_argument("--aac-sample-batch-size", type=int, default=1,
                         help="ARP AAC candidates per forward pass; total remains --aac-num-samples")
@@ -517,6 +534,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="append one JSON record per inference cycle",
     )
+    parser.add_argument("--sync-diagnostics", type=Path, help="append host-side phase and tracking diagnostics JSONL; does not change control")
     parser.add_argument("--task", default="pick up the block")
     parser.add_argument("--weights", choices=("ema", "model"), default="ema")
     # Lab topology documented in doc/old/THREADING_REAL.md: the controller
@@ -656,9 +674,29 @@ def prepare_initial_grasp(client, args, stop_requested):
     )
 
 
+def autohorizon_config_from_args(args):
+    if not args.autohorizon:
+        return None
+    if args.aac or args.chunk_selector is not None or args.execution_schedule is not None:
+        raise ValueError("--autohorizon cannot be combined with AAC, a selector or execution schedule")
+    if args.prediction_mode != "full_then_truncate":
+        raise ValueError("--autohorizon requires --prediction-mode full_then_truncate")
+    from autohorizon import AutoHorizonConfig
+    return AutoHorizonConfig(hold_thr=args.autohorizon_hold_thr,
+                             max_entropy_q=args.autohorizon_entropy_q,
+                             run_len=args.autohorizon_run_len, method=args.autohorizon_method)
+
+
 def run(args: argparse.Namespace) -> int:
+    from threading_real.scripts.deployment.sync_diagnostics import SyncDiagnostics
+    sync_diagnostics = SyncDiagnostics(getattr(args, 'sync_diagnostics', None))
+    sync_diagnostics.emit('configuration', parameters={k:getattr(args,k,None) for k in
+        ('synchronous','sync_require_target','sync_position_tolerance','sync_rotation_tolerance',
+         'sync_timeout','sync_settle_samples','sync_poll_hz','policy_hz','stream_hz',
+         'cartesian_stiffness','nullspace_stiffness','execute_steps')})
+    autohorizon_config = autohorizon_config_from_args(args)
     results = (EpisodeResults(args.results_csv, task="threading",
-                              condition="aac" if args.aac else ("selector" if args.chunk_selector else "no_selector"),
+                              condition="autohorizon" if args.autohorizon else ("aac" if args.aac else ("selector" if args.chunk_selector else "no_selector")),
                               executed=args.execute) if args.results_csv else None)
     from remote_controller.RemoteControllerClient import RemoteControllerClient
     try:
@@ -705,6 +743,9 @@ def run(args: argparse.Namespace) -> int:
         selector=args.chunk_selector,
         prediction_mode=args.prediction_mode,
     )
+    if autohorizon_config is not None:
+        from autohorizon.mvt import validate_mvt_policy
+        validate_mvt_policy(policy, autohorizon_config)
     if aac is not None:
         if not isinstance(policy, PI05DeploymentPolicy) and not getattr(policy, "uses_mvt", False):
             raise ValueError("--aac requires a pi0.5 or MVT ARP checkpoint")
@@ -749,7 +790,7 @@ def run(args: argparse.Namespace) -> int:
     max_execution_steps = execution_schedule.coarse_steps if execution_schedule else args.execute_steps
     if mvt_selector is not None:
         max_execution_steps = max(mvt_selector.candidate_chunks)
-    max_period = (policy.horizon if adaptive_pi05 or args.aac else max_execution_steps) / args.policy_hz
+    max_period = (policy.horizon if adaptive_pi05 or args.aac or args.autohorizon else max_execution_steps) / args.policy_hz
     if args.synchronous and args.sync_timeout <= max_period:
         raise ValueError("--sync-timeout must exceed the maximum executed chunk / policy_hz")
     if not adaptive_pi05:
@@ -820,6 +861,8 @@ def run(args: argparse.Namespace) -> int:
         if args.execute:
             streamer = client.create_trackc_streamer(command_ip=args.server_ip, command_port=args.command_port, stream_hz=args.stream_hz, samples_per_segment=samples)
         execution_text = "selector[4,10]" if adaptive_pi05 else str(args.execute_steps)
+        if args.autohorizon:
+            execution_text = f"AutoHorizon[1,{policy.horizon}]"
         if args.aac:
             execution_text = f"AAC[alpha={args.aac_alpha},N={args.aac_num_samples}]"
         if execution_schedule:
@@ -929,7 +972,10 @@ def run(args: argparse.Namespace) -> int:
             while not stop and not episode_stop:
                 if episode_stop_requested():
                     break
+                sync_diagnostics.episode, sync_diagnostics.cycle = episode, cycle + 1
+                sync_diagnostics.emit('camera_read_start', streamer=streamer)
                 camera_data = cameras.read_rgbd(args.camera_timeout_ms) if pointcloud_mode else cameras.read(args.camera_timeout_ms)
+                sync_diagnostics.emit('camera_read_end', streamer=streamer)
                 state, info = client.get_latest_state(allow_stale=False)
                 if state is None: raise RuntimeError(f"fresh robot state unavailable: {info}")
                 if state["arm_state"] == "ERROR": raise RuntimeError("remote controller reports arm ERROR")
@@ -947,11 +993,22 @@ def run(args: argparse.Namespace) -> int:
                     side, wrist, front = camera_data
                     history.append(make_observation(side, wrist, front, state["q"], width, args.image_size, args.pre_resize_image_size, tcp_position=T_observation[:3, 3]))
                     policy_obs = stack_observations(history, args.device, rgb_keys=rgb_keys)
+                sync_diagnostics.emit('observation', state=state, info=info, T=T_observation, streamer=streamer)
                 mvt_selection = None
                 aac_selection = None
+                autohorizon_selection = None
                 mode_diagnostics = {}
+                sync_diagnostics.emit('inference_start', streamer=streamer)
                 with torch.inference_mode():
-                    if mvt_mode and args.aac:
+                    if args.autohorizon:
+                        from autohorizon import predict_mvt_with_autohorizon
+                        prediction, autohorizon_selection = predict_mvt_with_autohorizon(
+                            policy, policy_obs, autohorizon_config)
+                        raw = prediction["action_pred"][0].detach().cpu().numpy()
+                        mode_diagnostics = dict(prediction["prediction_diagnostics"])
+                        mode_diagnostics.update(guard_scope="all_generated_actions", checked_steps=len(raw))
+                        policy.last_prediction_diagnostics = mode_diagnostics
+                    elif mvt_mode and args.aac:
                         from AAC.arp import predict_arp_aac
 
                         prediction, aac_selection = predict_arp_aac(
@@ -979,6 +1036,7 @@ def run(args: argparse.Namespace) -> int:
                         elapsed = time.monotonic() - start
                     else:
                         raw = policy.predict_action(policy_obs)["action"][0].detach().cpu().numpy()
+                sync_diagnostics.emit('inference_end', streamer=streamer)
                 # Inference itself is synchronous, so consume an Enter pressed while it
                 # was running before sending any newly predicted command to the robot.
                 if episode_stop_requested():
@@ -1026,13 +1084,20 @@ def run(args: argparse.Namespace) -> int:
                 if state is None or state["arm_state"] == "ERROR":
                     raise RuntimeError(f"fresh robot state unavailable before execution: {info}")
                 T_now = client.get_tcp_pose_from_q(robot_model, state["q"], frame_name="panda_hand_tcp")
+                drift_xyz, drift_rot = cartesian_pose_error(T_observation, T_now)
+                sync_diagnostics.emit('execution_origin', state=state, info=info, T=T_now, streamer=streamer,
+                                      observation_to_execution_translation_m=drift_xyz,
+                                      observation_to_execution_rotation_rad=drift_rot)
                 poses, widths, stats = integrate_cartesian_delta_chunk(raw, T_now, width, max_first_translation=args.max_first_translation, max_step_translation=args.max_step_translation, max_first_rotation=args.max_first_rotation, max_step_rotation=args.max_step_rotation, workspace_min=workspace_min, workspace_max=workspace_max)
                 execution_diagnostics = {}
                 if execution_schedule:
                     steps, execution_diagnostics = execution_schedule.select(T_now[:3, 3], poses)
                     execution_diagnostics["predicted_action_count"] = len(raw)
                     raw, poses, widths = raw[:steps], poses[:steps], widths[:steps]
-                if aac_selection is not None:
+                if autohorizon_selection is not None:
+                    steps = autohorizon_selection.h_star
+                    raw, poses, widths = raw[:steps], poses[:steps], widths[:steps]
+                elif aac_selection is not None:
                     steps = aac_selection.decision.h_star
                     raw, poses, widths = raw[:steps], poses[:steps], widths[:steps]
                 elif mvt_selection is not None:
@@ -1046,7 +1111,12 @@ def run(args: argparse.Namespace) -> int:
                     mode_diagnostics["selected_steps"] = len(raw)
                 sync_result = None
                 if streamer is not None:
+                    sync_diagnostics.emit('plan_submit', streamer=streamer, target_T=poses[-1],
+                                          waypoint_T=np.asarray(poses), action_count=len(raw),
+                                          policy_hz=args.policy_hz, stream_hz=args.stream_hz,
+                                          require_target=args.sync_require_target)
                     streamer.update_waypoints(poses, merge_mode="replace")
+                    sync_diagnostics.emit('plan_installed', streamer=streamer)
                     gripper.update(float(widths[-1]))
                     if args.synchronous:
                         sync_result = wait_for_trackc_segment(
@@ -1062,7 +1132,9 @@ def run(args: argparse.Namespace) -> int:
                             poll_hz=args.sync_poll_hz,
                             stop_requested=episode_stop_requested,
                             require_target=args.sync_require_target,
+                            diagnostics=sync_diagnostics,
                         )
+                        sync_diagnostics.emit('wait_return', streamer=streamer, result=sync_result)
                         if sync_result["stopped"]:
                             break
                         measured_state, _ = client.get_latest_state(allow_stale=False)

@@ -137,3 +137,31 @@ def test_cam1_only_deployment_does_not_read_or_send_front():
  assert p.rgb_keys==('sideview',)
  obs={'agent_pos':torch.zeros(1,1,9),'sideview':torch.zeros(1,1,3,490,644,dtype=torch.uint8)}
  assert p.predict_action(obs)['action'].shape==(1,50,7)
+
+
+def test_h10_policy_preserves_all_ten_actions():
+ class H10Client(Client):
+  def get_server_metadata(self):
+   return {**super().get_server_metadata(), 'horizon':10}
+  def infer(self,obs):
+   return {'actions':np.arange(60,dtype=np.float32).reshape(10,6)*.0001}
+ p=LocalPolicy(H10Client())
+ assert p.horizon==p.n_action_steps==10
+ obs={'agent_pos':torch.zeros(1,1,9),'frontview':torch.zeros(1,1,3,224,224,dtype=torch.uint8),'sideview':torch.zeros(1,1,3,224,224,dtype=torch.uint8)}
+ result=p.predict_action(obs)['action'].numpy()
+ assert result.shape==(1,10,7)
+ np.testing.assert_allclose(result[0,:,:6],np.arange(60,dtype=np.float32).reshape(10,6)*.0001)
+ assert not result[0,:,6].any()
+
+
+def test_h10_remote_rejects_wrong_chunk_length():
+ import pytest
+ from threading_real.pi05_openpi.deploy_remote import RemoteBackend
+ from openpi_client import msgpack_numpy
+ class Socket:
+  def send(self,data):pass
+  def recv(self,timeout):return msgpack_numpy.packb({'actions':np.zeros((50,6),np.float32)})
+ p=RemoteBackend.__new__(RemoteBackend)
+ p.ws=Socket();p.packer=msgpack_numpy.Packer();p.horizon=10
+ with pytest.raises(ValueError,match='Invalid remote action chunk'):
+  p._request({},1)

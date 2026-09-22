@@ -120,7 +120,29 @@ JAX=0.5.3、Flax=0.10.2、Orbax=0.11.13、Torch=2.7.1、cuDNN=9.5.1.17。共享�
 
 用户授权的旧 threading 实验清理清单在 `outputs/threading_cleanup_20260919.json`；其他实验、环境和原始数据未删除。
 
-## cam1 原始 640×480 输入（v8）
+## chunk=10 对照实验（v11）
+
+启动脚本 `start_v11_remote.sh`，参考v6归档的 `archive/pre_native640_20260921/run.py` 默认值及本README中的v6启动参数，唯一训练配方变化为horizon=50→10（30Hz下约0.333秒）。v6原始run配置和W&B记录目前不可用，不能声称已对其原始manifest逐项比对。
+
+恢复原80条224数据，seed42按72条训练/8条验证；cam1+cam3、本体状态、默认图像增强、vision LoRA rank16 + action expert全量、batch12/FSDP2、lr2.5e-5、warmup250、10000步均沿用v6。每1000步验证、2000步保存，保留全部5份；从pi05_base初始化，单独重算chunk10归一化。新实验名 `threading_tcp6_30hz_h10_vision_lora_action_full_v11`，日志 `logs/train_tcp6_h10_v11_20260921.log`。首次启动设置 `V10_HANDOFF_PID=4181918`，等待v10的500步checkpoint提交后停止v10再接管六卡；独立启动时不设置该变量。
+
+## 单轨迹过拟合实验（v10）
+
+2026-09-21 按用户要求停止 v9，改用 `start_overfit1_remote.sh` 从 pi05_base 重新训练。`--overfit-episodes 1 --seed 42` 选择原10条中的 episode 33，共655帧；训练、归一化及同集评估仅使用该轨迹。其余配置沿用v9：单cam1 native640、vision LoRA + action expert全量、batch=6、10000步、每500步评估保存、保留最近5份。独立实验名为 `threading_tcp6_cam1_native640_overfit1_v10`，日志 `logs/train_cam1_native640_overfit1_v10_20260921.log`。
+
+v10首次六卡运行55分钟未完成首步，已停止并归档到服务器 `archive/overfit1_v10_stalled_20260921`。2026-09-21改用GPU 0、1，保持global batch=6、FSDP=2，确认step20参数范数发生变化，约1.8秒/步；新W&B为 https://wandb.ai/huiyuan_tac/threading_pi05_openpi/runs/hvepooxy 。具体卡住原因尚未定位。训练日志现在记录前5步，非评估步即时提交W&B，评估步与评估指标合并提交。
+
+## 10 episodes 过拟合实验（v9，已停止）
+
+2026-09-21 按用户要求停止 v8（最后记录 step 780，未产生 checkpoint），启动入口为 `start_overfit10_remote.sh`。沿用单 cam1 原始像素、vision LoRA + action expert 全量微调，重新从 pi05_base 初始化。
+
+`--overfit-episodes 10 --seed 42` 固定选择 episode `[0, 21, 25, 28, 33, 37, 40, 51, 60, 61]`，共 5932 帧。训练、归一化和评估仅使用这 10 条完整轨迹；复用原始数据集，通过全局帧索引筛选，不修改标签或复制图像。batch=6，10000 steps，每500 steps评估、500 steps保存，保留最近5份checkpoint以控制磁盘占用。归一化和checkpoint均使用独立实验名 `threading_tcp6_cam1_native640_overfit10_v9`。
+
+W&B评估指标为 `train_eval_loss`，scope为 `train_reconstruction`：它是同一训练集上的固定噪声flow loss，不是独立验证误差，也不等价于真实动作误差或实机成功率。日志为 `logs/train_cam1_native640_overfit10_v9_20260921.log`。
+
+清理审计见 `logs/cleanup_before_overfit10_v9.json`：仅移除服务器旧224数据和对应可重建HF缓存，释放约6.3GiB；删除前167个数据文件SHA256全部与本机持久副本一致。保留基础权重、原始数据和新实验复用的native数据缓存。
+
+## cam1 原始 640×480 输入（v8，已停止）
 
 `run_native640.sh` 默认选择独立 v8 实验 `threading_tcp6_cam1_native640_vision_lora_action_full_v8`，通过 `--camera-views cam1` 只使用 cam1；保留 v6 的 action expert 全量 + vision LoRA 训练范围，总可训练参数仍为 438,793,760。
 图像来自原始 640×480 视频帧，数据集保存未缩放 RGB；输入模型前左右各补 2、上下各补 5 像素黑边，得到 644×490。没有裁剪、缩放或图像增强。

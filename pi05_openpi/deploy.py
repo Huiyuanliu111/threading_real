@@ -21,7 +21,9 @@ class LocalPolicy(torch.nn.Module):
  def __init__(self,client):
   super().__init__();self.client=client
   m=client.get_server_metadata()
-  if any(m.get(k)!=v for k,v in dict(kind='threading_openpi_tcp6',horizon=50,state_dim=9,action_dim=6,fps=30).items()):raise ValueError(f'Incompatible server metadata: {m}')
+  if any(m.get(k)!=v for k,v in dict(kind='threading_openpi_tcp6',state_dim=9,action_dim=6,fps=30).items()):raise ValueError(f'Incompatible server metadata: {m}')
+  if m.get('horizon') not in (10,50):raise ValueError('Unsupported model horizon')
+  self.horizon=self.n_action_steps=m['horizon']
   self.metadata=m;self.task=m['task'];print('[openpi] model:',m,flush=True)
   self.image_profile=m.get('image_profile','224')
   if self.image_profile not in ('224','native640'):raise ValueError('Unsupported image profile')
@@ -35,7 +37,7 @@ class LocalPolicy(torch.nn.Module):
   for name,key in cameras:
    payload[name]=obs[key][0,-1].cpu().numpy().transpose(1,2,0)
   a=np.asarray(self.client.infer(payload)['actions'],dtype=np.float32)
-  if a.shape!=(50,6) or not np.isfinite(a).all():raise ValueError('Invalid OpenPI actions')
+  if a.shape!=(self.horizon,6) or not np.isfinite(a).all():raise ValueError('Invalid OpenPI actions')
   # Seventh runner channel is constant zero; it is not a model output.
   a=np.pad(a,((0,0),(0,1)))
   return {'action':torch.from_numpy(a[:self.n_action_steps]).unsqueeze(0)}
@@ -45,18 +47,19 @@ class LocalBackend:
   import json
   from run import setup
   settings=json.loads(Path(run_config).read_text())
-  if settings.get('physical_action_dim')!=6 or settings.get('physical_state_dim')!=9 or settings.get('horizon')!=50:
-   raise ValueError('Expected TCP6/state9/H50 configuration')
+  if settings.get('physical_action_dim')!=6 or settings.get('physical_state_dim')!=9 or settings.get('horizon') not in (10,50):
+   raise ValueError('Expected TCP6/state9 and horizon 10 or 50')
   config=setup(settings)
   import jax
   if jax.default_backend()!='gpu':raise RuntimeError('OpenPI requires the local CUDA backend')
   from openpi.policies.policy_config import create_trained_policy
   self.policy=create_trained_policy(config,Path(checkpoint),sample_kwargs={'num_steps':10})
+  self.horizon=settings['horizon']
   self.checkpoint=str(Path(checkpoint).resolve())
   self.image_profile=settings.get('image_profile','224')
   self.camera_views=settings.get('camera_views','both')
  def get_server_metadata(self):
-  return dict(kind='threading_openpi_tcp6',horizon=50,state_dim=9,action_dim=6,fps=30,checkpoint=self.checkpoint,task='insert the grasped block through the needle',image_profile=self.image_profile,camera_views=self.camera_views)
+  return dict(kind='threading_openpi_tcp6',horizon=self.horizon,state_dim=9,action_dim=6,fps=30,checkpoint=self.checkpoint,task='insert the grasped block through the needle',image_profile=self.image_profile,camera_views=self.camera_views)
  def infer(self,obs):return self.policy.infer(obs)
 
 class LockedGripper:

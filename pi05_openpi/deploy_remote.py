@@ -14,9 +14,11 @@ class RemoteBackend:
   self.ws=connect(f'ws://{args.policy_host}:{args.policy_port}',compression=None,max_size=4*1024*1024,open_timeout=10,close_timeout=2)
   try:
    self.metadata=msgpack_numpy.unpackb(self.ws.recv(timeout=10))
-   expected=dict(kind='threading_openpi_tcp6',horizon=50,state_dim=9,action_dim=6,fps=30)
+   expected=dict(kind='threading_openpi_tcp6',state_dim=9,action_dim=6,fps=30)
    if any(self.metadata.get(k)!=v for k,v in expected.items()):raise ValueError(f'Incompatible remote model: {self.metadata}')
    if self.metadata['checkpoint']!=str(args.checkpoint):raise ValueError('Server checkpoint differs from requested path')
+   self.horizon=self.metadata.get('horizon')
+   if self.horizon not in (10,50):raise ValueError('Unsupported remote horizon')
    self.packer=msgpack_numpy.Packer()
    # Compile before any robot or camera initialization; discard this synthetic prediction.
    shape=(490,644,3) if self.metadata.get('image_profile')=='native640' else (224,224,3)
@@ -37,11 +39,11 @@ class RemoteBackend:
   if isinstance(response,str):raise RuntimeError(f'Remote policy error: {response}')
   result=msgpack_numpy.unpackb(response)
   a=np.asarray(result['actions'])
-  if a.shape!=(50,6) or not np.isfinite(a).all():raise ValueError('Invalid remote action chunk')
+  if a.shape!=(self.horizon,6) or not np.isfinite(a).all():raise ValueError('Invalid remote action chunk')
   return result
  def infer(self,obs):
   started=time.monotonic();result=self._request(obs,self.timeout)
-  print(f'[remote] roundtrip={time.monotonic()-started:.3f}s actions=50x6',flush=True)
+  print(f'[remote] roundtrip={time.monotonic()-started:.3f}s actions={self.horizon}x6',flush=True)
   return result
  def close(self):self.ws.close()
 

@@ -6,14 +6,31 @@ from pathlib import Path
 import numpy as np
 
 
-def episode_split(root, fraction, seed):
+def episode_split(root, fraction, seed, overfit_episodes=0):
     episodes = [json.loads(line) for line in (Path(root) / 'meta/episodes.jsonl').read_text().splitlines()]
     episodes.sort(key=lambda row: row['episode_index'])
-    if not 0 < fraction < 1 or len(episodes) < 2:
+    if isinstance(overfit_episodes, bool) or not isinstance(overfit_episodes, int) or not 0 <= overfit_episodes <= len(episodes):
+        raise ValueError('overfit_episodes must be an integer between 0 and the dataset episode count')
+    if not overfit_episodes and (not 0 < fraction < 1 or len(episodes) < 2):
         raise ValueError('Validation requires >=2 episodes and 0 < val_fraction < 1')
     ids = [row['episode_index'] for row in episodes]
     if ids != list(range(len(ids))) or any(row['length'] <= 0 for row in episodes):
         raise ValueError('Expected contiguous episode IDs and positive episode lengths')
+    if overfit_episodes:
+        selected = sorted(np.random.default_rng(seed).permutation(ids)[:overfit_episodes].tolist())
+        selected_set = set(selected)
+        frames = []
+        offset = 0
+        for row in episodes:
+            if row['episode_index'] in selected_set:
+                frames.extend(range(offset, offset + row['length']))
+            offset += row['length']
+        manifest = {'seed': seed, 'overfit_episodes': overfit_episodes,
+                    'evaluation_scope': 'train_reconstruction',
+                    'train_episodes': selected, 'val_episodes': selected.copy(),
+                    'train_frames': len(frames), 'val_frames': len(frames),
+                    'episode_lengths': [row['length'] for row in episodes]}
+        return manifest, {'train': frames, 'val': frames.copy()}
     count = max(1, min(len(ids) - 1, math.ceil(len(ids) * fraction)))
     held_out = set(np.random.default_rng(seed).permutation(ids)[:count].tolist())
     indices = {'train': [], 'val': []}
@@ -30,6 +47,11 @@ def episode_split(root, fraction, seed):
     return manifest, indices
 
 
+def split_from_settings(settings):
+    return episode_split(settings['dataset_root'], settings['val_fraction'], settings['seed'],
+                         settings.get('overfit_episodes', 0))
+
+
 def is_improvement(loss, best):
     return math.isfinite(loss) and loss < best
 
@@ -37,7 +59,7 @@ def is_improvement(loss, best):
 def raw_subset(config, settings, part):
     from openpi.training import data_loader as loader
     from torch.utils.data import Subset
-    _, indices = episode_split(settings['dataset_root'], settings['val_fraction'], settings['seed'])
+    _, indices = split_from_settings(settings)
     data_config = config.data.create(config.assets_dirs, config.model)
     raw = loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)
     return data_config, Subset(raw, indices[part])
@@ -67,7 +89,7 @@ def compute_norm(config, settings):
             running.update(np.asarray(batch[key]))
     destination = config.assets_dirs / data_config.asset_id
     normalize.save(destination, {key: value.get_statistics() for key, value in stats.items()})
-    split, _ = episode_split(settings['dataset_root'], settings['val_fraction'], settings['seed'])
+    split, _ = split_from_settings(settings)
     (destination / 'provenance.json').write_text(json.dumps({
         'split': split, 'horizon': config.model.action_horizon, 'fps': 30,
         'all_train_frames_included': True, 'gripper_removed': True, 'physical_action_dim': 6, 'physical_state_dim': 9,
@@ -77,7 +99,7 @@ def compute_norm(config, settings):
 def validate_norm(config, settings):
     destination = config.assets_dirs / config.data.create(config.assets_dirs, config.model).asset_id
     provenance = json.loads((destination / 'provenance.json').read_text())
-    split, _ = episode_split(settings['dataset_root'], settings['val_fraction'], settings['seed'])
+    split, _ = split_from_settings(settings)
     expected = {'split': split, 'horizon': config.model.action_horizon, 'fps': 30,
                 'all_train_frames_included': True, 'gripper_removed': True, 'physical_action_dim': 6, 'physical_state_dim': 9}
     if provenance != expected:

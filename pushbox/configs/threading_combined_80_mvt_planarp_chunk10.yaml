@@ -1,0 +1,7 @@
+# Controlled comparison with the cam1 PlanARP v2 run: only dense chunk size changes.
+defaults:
+  - threading_combined_80_mvt_planarp_v2
+  - _self_
+
+policy:
+  action_chunk_size: 10
