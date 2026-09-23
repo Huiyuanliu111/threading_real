@@ -195,3 +195,155 @@ python threading_real/scripts/diagnostics/summarize_selector_decode_latency.py
 这里的每段 trace 平均值覆盖全部 20 段，不是只统计成功 episodes。
 它只包含 coarse-plan 与 action 解码，不包含视觉、selector、通信、机器人运动或等待；
 不能把解码节省百分比当作整个任务耗时的下降比例。
+
+## ARP 解码占完整推理的比例
+
+为避免把不同计时范围直接相除，另在同一次完整 selector 推理内部记录嵌套 CUDA events。
+完整推理路径使用主实验的 selector checkpoint 和 `full_then_truncate`：
+
+```text
+已在 GPU 的训练观测 → 点云渲染 / 视觉编码 → selector → 完整 ARP 解码 → 动作后处理
+```
+
+仅预先加载观测；每次重新运行视觉编码，不复用视觉缓存。使用与上文相同的训练样本、model 权重、
+FP32、batch size 1 和确定性解码。每项任务预热 30 次，再测 12×10 次完整调用。
+每次在最外层结束后同步；解码边界只记录 events，不额外同步或拆开推理链。
+下表的比例为同一批调用的平均 ARP latency / 平均完整推理 latency。
+
+| 任务 | 完整推理 / call | 其中 ARP 解码 | 点云渲染 + 视觉编码 | 其余 selector / 上下文准备 / 后处理 | ARP 占比 |
+|---|---:|---:|---:|---:|---:|
+| Threading H20 | **132.106 ms** | 99.187 ms | 25.511 ms | 7.408 ms | **75.08%** |
+| Maze H10 | **52.767 ms** | 22.531 ms | 25.658 ms | 4.578 ms | **42.70%** |
+
+“其余”是完整时间减去解码和视觉时间的残差，不是单独测得的 selector 延迟。
+完整推理的 batch SD 分别为 0.415 ms 和 0.910 ms。
+同步 wall time 均值分别为 132.123 ms 和 52.780 ms，与 CUDA-event 总时间接近。
+
+这里的完整推理不含相机读取、观测构建和 CPU→GPU 搬运、部署动作检查、网络通信或机器人执行。
+仍然是各任务单个训练观测的离线测量，不是实机各阶段观测的平均值。
+嵌入完整推理时的 ARP 延迟与之前缓存特征的隔离测量略有差异；占比采用本节同时测得的值。
+
+若仅用上节加权节省除以本节完整推理时间，并假设视觉、selector、后处理与调用分布均不变，
+则完整**模型推理**时间的预计降幅为：
+
+- Threading：32.052 / 132.106 ≈ **24.26%**。
+- Maze：4.351 / 52.767 ≈ **8.25%**。
+
+以上降幅为跨两组 microbenchmark 组合的估算，不是完整 required-only 推理或实机任务耗时的直接实测。
+
+原始记录：[Threading 完整推理](../../data/analysis/arp_decode_latency_20260922/threading_full_inference.json)、
+[Maze 完整推理](../../data/analysis/arp_decode_latency_20260922/maze_full_inference.json)。
+脚本：[benchmark_selector_inference_latency.py](../scripts/diagnostics/benchmark_selector_inference_latency.py)。
+原始 JSON 保存逐调用分项计时、selector 文件 SHA-256、模型和观测定位。
+
+从仓库根目录顺序复现：
+
+```bash
+LD_LIBRARY_PATH=/home/huiyuan/miniconda3/envs/pushbox/lib \
+/home/huiyuan/miniconda3/envs/pushbox/bin/python \
+  threading_real/scripts/diagnostics/benchmark_selector_inference_latency.py \
+  --task threading --warmup 30 --batches 12 --calls 10 \
+  --output data/analysis/arp_decode_latency_20260922/threading_full_inference.json
+
+LD_LIBRARY_PATH=/home/huiyuan/miniconda3/envs/pushbox/lib \
+/home/huiyuan/miniconda3/envs/pushbox/bin/python \
+  threading_real/scripts/diagnostics/benchmark_selector_inference_latency.py \
+  --task maze --warmup 30 --batches 12 --calls 10 \
+  --output data/analysis/arp_decode_latency_20260922/maze_full_inference.json
+
+```
+
+## 实机循环还有哪些耗时：已有记录核查
+
+模型推理约 0.1 秒不等于一次机器人决策循环约 0.1 秒。现有 runner 顺序经历：
+相机读取 → 状态 / FK / 点云构建与搬运 → 模型推理 → 动作检查与轨迹安装 →
+发送并执行 chunk → 同步等待 → 下一次观测。
+
+从主实验原始 trace 重新统计，保留首次调用和所有有效记录：
+
+| 项目 | Threading H20 selector | Maze H10 selector |
+|---|---:|---:|
+| 实机推理时间 | 168 次，均值 129.192 ms，中位 126.547 ms，P95 133.763 ms，最大 460.317 ms | trace 未记录独立推理耗时 |
+| 同一段内相邻决策记录间隔 | 148 个间隔，均值 1.808 s，中位 1.387 s，P95 3.099 s | 324 个间隔，均值 1.019 s，中位 0.707 s，P95 1.551 s |
+| 7.5 Hz 下的名义动作时长 | 8 步 1.067 s；20 步 2.667 s | 4 步 0.533 s；10 步 1.333 s |
+
+推理字段 `total_seconds` 的代码计时范围包含模型前向和结果取回 CPU，不包含前面的观测构建。
+决策时间戳写在动作等待之后；相邻记录只在 episode 相同且 cycle 连续时相减，不跨手动复位间隔。
+它们是完成记录之间的 wall-time 间隔，并非独立网络 RTT，也不是纯 GPU 时间。
+Maze 个别间隔小于名义动作时长（最小 0.197 s），所以不能直接用名义时长反推出每次完整执行的耗时；
+现有 trace 缺少发送 / 等待完成标记，未据此推断网络时间。
+
+Threading 对相同的 148 个间隔，逐条扣除下一次记录对应的 `k/7.5` 后，平均剩余 342.012 ms；
+再扣除该次实测 `total_seconds`，平均剩余 **214.902 ms**。
+这是以名义动作时长为基准的混合残差，含相机读取、状态读取、FK / 点云构建、搬运、RPC、
+轨迹安装、轮询和实际发送时长相对名义时长的偏差，不能全部归为通信。
+Threading 默认每 20 ms 轮询一次，连续 3 次满足完成条件才返回；Maze 默认每 20 ms 轮询一次。
+默认 500 Hz UDP 发送周期为 2 ms，发送周期同样不是网络延迟。
+
+### 能否确定通信时间
+
+ARP 主实验在本机推理，不需要把图像发给远程 GPU。机器人侧主要是 UDP 动作发送 / 状态回传，
+另有 XML-RPC 调用，例如 Threading 每次读取夹爪宽度的 `getGripperWidth()`。
+当前主实验 trace 没有网络 RTT、控制端接收确认或跨主机对时数据，因此**机器人通信延迟尚无可靠独立实测值**。
+
+另找到一条 [OpenPI 远程部署诊断](../../data/analysis/pi05_openpi_remote_eval/logs/sync_diagnostics.jsonl)，
+属于其他策略、单个最终超时的循环，只能作为计时字段的实例，不能代表 ARP：
+
+| 该单次记录的阶段 | 耗时 |
+|---|---:|
+| 相机 read 调用 | 0.704 ms |
+| 相机 read 结束 → observation 构建结束 | 22.947 ms |
+| 远程推理调用 | 145.896 ms |
+| 推理结束 → 提交轨迹 | 4.501 ms |
+| 提交轨迹 → 安装完成 | 30.032 ms |
+| 安装后等待至超时 | 5.003 s |
+
+相机 read 耗时不等于图像曝光到使用时的年龄；轨迹安装耗时也不等于网络传输。
+该记录的 83 个状态样本，缓存年龄均值 0.970 ms、P95 1.947 ms。
+源码在本机收到 UDP 数据并写入缓存时打时间戳，因此这是**接收后缓存年龄，不是单向网络延迟或 RTT**。
+
+[OpenPI 历史延迟文档](../../doc/deploy_pi05_openpi.md) 另记载：2026-09-21 的 H50 / A40 测量，
+远程往返平均 163 ms，服务器内部推理 157 ms，传输、序列化等合计约 6 ms。
+这是本机 ↔ GPU 服务器链路，不是本机 ↔ 机器人链路；本次未找到该文档链接的原始
+`latency_comparison.json/md`，故只保留为历史文档记录，不作为当前网络测量结论。
+
+本次原始统计保存在 [deployment_timing_evidence.json](../../data/analysis/arp_decode_latency_20260922/deployment_timing_evidence.json)。
+要独立测机器人通信，需要增加只读 RPC 往返计时或带序号的发送 / 控制端接收确认；
+单向网络延迟还需要跨主机时钟同步。本次只核查已有文件，未连接或操作机器人。
+
+## Selector 独立耗时（2026-09-23 补测）
+
+在完整 `predict_with_selector` 调用中，为 `select_from_visual` 单独记录 CUDA events。
+范围包含共享视觉 token 的整理 / 池化、selector 网络前向、概率计算和 chunk 长度选择；
+不含共享视觉编码器，不含后续 `chunk_sizes.max().item()` 读取 Python 整数，也不含 ARP 解码。
+仍使用主实验 checkpoint、训练集第 0 个观测、batch size 1、FP32、RTX 4060 Ti；
+预热 30 次，测量 12×10 次完整调用，最外层同步，分项内部不额外同步。
+
+| 任务 | Selector latency/call | Batch SD | 本轮完整推理/call | Selector 占比 |
+|---|---:|---:|---:|---:|
+| Threading H20 / h8 selector | **2.763 ms** | 0.089 ms | 128.820 ms | **2.14%** |
+| Maze H10 / h4 selector | **2.947 ms** | 0.129 ms | 53.334 ms | **5.53%** |
+
+两组 selector 约需 **3 ms/次**。这不是“从原始图像开始”的 selector 全流程时间：
+其视觉输入复用动作模型本来就需要的编码结果。本节直接测量 selector 调用，
+此前的 7.408 / 4.578 ms 是 selector、上下文准备和动作后处理的合计残差，不能当作 selector 本身耗时。
+占比使用本轮同时测得的完整推理时间；不同轮次的 GPU 时间有波动，保留前一天结果不覆盖。
+
+原始结果：[Threading](../../data/analysis/arp_decode_latency_20260923/threading_selector_timing.json)、
+[Maze](../../data/analysis/arp_decode_latency_20260923/maze_selector_timing.json)。
+复用并扩展 [完整推理计时脚本](../scripts/diagnostics/benchmark_selector_inference_latency.py)，在仓库根目录顺序执行：
+
+```bash
+LD_LIBRARY_PATH=/home/huiyuan/miniconda3/envs/pushbox/lib \
+/home/huiyuan/miniconda3/envs/pushbox/bin/python \
+  threading_real/scripts/diagnostics/benchmark_selector_inference_latency.py \
+  --task threading --warmup 30 --batches 12 --calls 10 \
+  --output data/analysis/arp_decode_latency_20260923/threading_selector_timing.json
+
+LD_LIBRARY_PATH=/home/huiyuan/miniconda3/envs/pushbox/lib \
+/home/huiyuan/miniconda3/envs/pushbox/bin/python \
+  threading_real/scripts/diagnostics/benchmark_selector_inference_latency.py \
+  --task maze --warmup 30 --batches 12 --calls 10 \
+  --output data/analysis/arp_decode_latency_20260923/maze_selector_timing.json
+
+```

@@ -10,6 +10,46 @@ def read(path):
         return list(csv.DictReader(f))
 
 
+@pytest.mark.parametrize('seconds', [30., 50.])
+def test_episode_deadline_boundary_and_reset(monkeypatch, seconds):
+    now = [100.]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: now[0])
+    timer = module.EpisodeDeadline(seconds)
+    assert not timer.expired()
+    timer.start()
+    now[0] += seconds - .1
+    assert not timer.expired()
+    now[0] = 100. + seconds
+    assert timer.expired()
+    assert timer.remaining() == 0
+    timer.start()
+    assert not timer.expired()
+    assert timer.remaining() == seconds
+
+
+@pytest.mark.parametrize('seconds', [0, -1, float('nan'), float('inf')])
+def test_episode_deadline_rejects_invalid_limits(seconds):
+    with pytest.raises(ValueError, match='episode-timeout'):
+        module.EpisodeDeadline(seconds)
+
+
+def test_timeout_is_saved_as_failure_without_result_prompt(tmp_path, monkeypatch):
+    now = [100.]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: now[0])
+    r = module.EpisodeResults(tmp_path / 'run.csv', task='maze', condition='selector', executed=True)
+    r.start(1)
+    now[0] = 150.
+    r.end('timeout')
+    r.end('max_cycles')
+    r.end('interrupted')
+    monkeypatch.setattr(module.select, 'select', lambda *a: pytest.fail('timeout must not prompt'))
+    r.prompt(lambda: False)
+    row = read(r.path)[0]
+    assert row['status'] == 'timeout'
+    assert row['success'] == '0'
+    assert row['duration_s'] == '50.000000'
+
+
 def test_duration_saved_before_prompt_and_result_survives_new_episode(tmp_path, monkeypatch):
     clock = iter([100., 112.5, 200., 202.])
     monkeypatch.setattr(module.time, 'monotonic', lambda: next(clock))

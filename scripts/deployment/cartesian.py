@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -566,6 +567,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="MVT endpoint-based execution YAML; overrides fixed --execute-steps",
     )
     parser.add_argument("--max-cycles", type=int, default=0)
+    parser.add_argument("--episode-timeout", type=float, default=30.0,
+                        help="execution time limit per episode in seconds (default: 30)")
     parser.add_argument(
         "--episodes",
         type=int,
@@ -614,6 +617,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="optionally downsample live RGB here before resizing to policy input size",
     )
     parser.add_argument("--camera-timeout-ms", type=int, default=1000)
+    parser.add_argument("--record-video", action=argparse.BooleanOptionalAction, default=True,
+                        help="automatically record cam1/sideview and cam3/frontview per episode")
+    parser.add_argument("--video-output-dir", type=Path, default=PROJECT_ROOT / "outputs" / "deployment_videos",
+                        help="video root; each run/episode gets separate cam1.mp4 and cam3.mp4 files")
     parser.add_argument("--state-timeout", type=float, default=2.0)
     parser.add_argument("--cartesian-stiffness", type=float, nargs=6, default=[200, 200, 200, 15, 15, 15])
     parser.add_argument("--nullspace-stiffness", type=float, default=1.0)
@@ -688,6 +695,8 @@ def autohorizon_config_from_args(args):
 
 
 def run(args: argparse.Namespace) -> int:
+    from threading_real.episode_results import EpisodeDeadline
+    episode_deadline = EpisodeDeadline(args.episode_timeout)
     from threading_real.scripts.deployment.sync_diagnostics import SyncDiagnostics
     sync_diagnostics = SyncDiagnostics(getattr(args, 'sync_diagnostics', None))
     sync_diagnostics.emit('configuration', parameters={k:getattr(args,k,None) for k in
@@ -834,6 +843,7 @@ def run(args: argparse.Namespace) -> int:
         pointcloud_bounds = bounds_tensor.detach().cpu().numpy().reshape(-1)
     client = RemoteControllerClient(args.server_url, capacity=max(16, int(policy.n_obs_steps) + 2), horizon_prev=int(policy.n_obs_steps), sensor_size=29)
     cameras = streamer = None
+    video_directory = None
     stop = False
     def request_stop(*_args: Any) -> None:
         nonlocal stop
@@ -852,11 +862,20 @@ def run(args: argparse.Namespace) -> int:
             client.gripper_release(args.gripper_speed, queue=True)
             state = client.wait_for_first_udp(timeout=args.state_timeout)
         robot_model = RobotModel()
+        enabled_views = pointcloud_views if pointcloud_mode else rgb_keys
+        if args.record_video:
+            enabled_views = tuple(view for view in ("sideview", "wrist", "frontview")
+                                  if view in enabled_views or view in ("sideview", "frontview"))
         cameras = RealSenseRig(
             args.sideview_serial, args.wrist_serial, args.frontview_serial,
             fps=30, enable_depth=pointcloud_mode,
-            enabled_views=pointcloud_views if pointcloud_mode else rgb_keys,
+            enabled_views=enabled_views,
         )
+        if args.record_video:
+            from scripts.deployment.video_recording import RecordingCameraRig
+            video_directory = (args.video_output_dir.expanduser().resolve()
+                               / datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+            cameras = RecordingCameraRig(cameras, timeout_ms=args.camera_timeout_ms, fps=30)
         samples = max(1, round(args.stream_hz / args.policy_hz))
         if args.execute:
             streamer = client.create_trackc_streamer(command_ip=args.server_ip, command_port=args.command_port, stream_hz=args.stream_hz, samples_per_segment=samples)
@@ -930,6 +949,8 @@ def run(args: argparse.Namespace) -> int:
                 )
 
             gripper = GripperController(client, args, client.get_gripper_width())
+            if video_directory is not None:
+                cameras.start_recording(video_directory / f"episode_{episode:04d}")
             history: deque[Any] = deque(maxlen=int(policy.n_obs_steps))
             for _ in range(int(policy.n_obs_steps)):
                 camera_data = cameras.read_rgbd(args.camera_timeout_ms) if pointcloud_mode else cameras.read(args.camera_timeout_ms)
@@ -956,12 +977,18 @@ def run(args: argparse.Namespace) -> int:
 
             if results:
                 results.start(episode)
+            episode_deadline.start()
             cycle = 0
             next_cycle = time.monotonic()
             episode_stop = False
 
             def episode_stop_requested() -> bool:
                 nonlocal episode_stop
+                if not stop and not episode_stop and episode_deadline.expired():
+                    episode_stop = True
+                    if results:
+                        results.end("timeout")
+                    print(f"[episode {episode}/{args.episodes}] Timeout after {args.episode_timeout:g}s.", flush=True)
                 if not episode_stop and episode_end_requested():
                     episode_stop = True
                     if results:
@@ -1110,6 +1137,8 @@ def run(args: argparse.Namespace) -> int:
                     mode_diagnostics["executed_steps"] = len(raw) if args.execute else 0
                     mode_diagnostics["selected_steps"] = len(raw)
                 sync_result = None
+                if episode_stop_requested():
+                    break
                 if streamer is not None:
                     sync_diagnostics.emit('plan_submit', streamer=streamer, target_T=poses[-1],
                                           waypoint_T=np.asarray(poses), action_count=len(raw),
@@ -1208,7 +1237,7 @@ def run(args: argparse.Namespace) -> int:
                     continue
                 period = len(raw) / args.policy_hz
                 next_cycle += period; remaining = next_cycle-time.monotonic()
-                if remaining > 0: time.sleep(remaining)
+                if remaining > 0: time.sleep(min(remaining, episode_deadline.remaining()))
                 else: print(f"[runner] warning: inference overran replan period by {-remaining:.3f}s"); next_cycle=time.monotonic()
 
             if results:
@@ -1225,6 +1254,8 @@ def run(args: argparse.Namespace) -> int:
                     "Use the Franka hand-guiding controls for manual reset; this runner "
                     "does not enable freedrive."
                 )
+            if video_directory is not None:
+                cameras.stop_recording()
             if results and not stop:
                 results.prompt(lambda: stop)
             print(f"[episode {episode}/{args.episodes}] Finished after {cycle} cycles.")
@@ -1234,9 +1265,17 @@ def run(args: argparse.Namespace) -> int:
             if results:
                 results.end("interrupted")
         finally:
-            if streamer is not None: streamer.close()
-            if cameras is not None: cameras.close()
-            client.close(); signal.signal(signal.SIGINT, old_int); signal.signal(signal.SIGTERM, old_term)
+            try:
+                if streamer is not None: streamer.close()
+            finally:
+                try:
+                    if cameras is not None: cameras.close()
+                finally:
+                    try:
+                        client.close()
+                    finally:
+                        signal.signal(signal.SIGINT, old_int)
+                        signal.signal(signal.SIGTERM, old_term)
 
 
 def main() -> int:

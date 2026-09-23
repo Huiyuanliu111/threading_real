@@ -10,6 +10,25 @@ import tempfile
 import time
 
 
+class EpisodeDeadline:
+    """Monotonic execution budget, independent of whether CSV logging is enabled."""
+
+    def __init__(self, seconds):
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError('episode-timeout must be finite and positive')
+        self.seconds = seconds
+        self.deadline = None
+
+    def start(self):
+        self.deadline = time.monotonic() + self.seconds
+
+    def remaining(self):
+        return self.seconds if self.deadline is None else max(0.0, self.deadline - time.monotonic())
+
+    def expired(self):
+        return self.deadline is not None and self.remaining() <= 0
+
+
 class EpisodeResults:
     fields = ['episode', 'task', 'condition', 'executed', 'started_at',
               'duration_s', 'success', 'status']
@@ -81,6 +100,8 @@ class EpisodeResults:
         elapsed = time.monotonic() - self.started
         self.rows[-1].update(duration_s=f'{elapsed:.6f}',
                              status='pending_result' if reason == 'enter' else reason)
+        if reason == 'timeout':
+            self.rows[-1]['success'] = '0'
         self.save()
 
     def set_result(self, value):
